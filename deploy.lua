@@ -82,7 +82,7 @@ local function discoverFine(strict)
 end
 local ROLE=FLEET_ROLES or (args[1]~='test_api' and newRoles() or nil)
 local DEPLOY_VERBOSE=false
-local ADMIN_VERSION='2026.10.20-r15'
+local ADMIN_VERSION='2026.10.20-r16'
 local REQUEST=42615
 local RESPONSE=42616
 local MAGIC='fleet_admin_v1'
@@ -402,21 +402,37 @@ local function updateFleet(command)
     else before[id]=i end
   end)
   if failed then return false,'STOP verification failed; no file changes' end
+  local function needsBootstrap(i)
+    return not i or not i.capabilities or i.capabilities.bundle~=1 or i.capabilities.spacePreflight~=2
+      or not i.storage or i.storage.free==nil
+  end
+  local function nodeSpaceNeed(i)
+    local backup,growth,largest=0,0,0
+    for _,name in ipairs({'fleet.lua','fleet_admin.lua','startup_node.lua'})do
+      local key=name=='fleet.lua' and 'fleet' or name=='fleet_admin.lua' and 'admin' or 'startup'
+      local f=i.files and i.files[key]
+      local old=f and finite(f.size) and f.size or 0
+      if not f or f.checksum~=sums[name] then
+        backup=backup+old
+        growth=growth+math.max(0,#proposed[name]-old)
+        largest=math.max(largest,#proposed[name])
+      end
+    end
+    return backup+growth+largest+32768
+  end
   phase('PREFLIGHT')
   local preflightOK,preflightError=pcall(function()
     assert(fs.exists('startup.lua'),'startup.lua missing; install startup_15.lua as startup.lua')
     FLEET15.recoverSelf(proposed)
     FLEET15.preflightSelf(proposed)
     for _,id in ipairs(command.targets)do
-      local i=before[id];local need=32768;local maxSize=0
-      for _,name in ipairs({'fleet.lua','fleet_admin.lua','startup_node.lua'})do
-        local key=name=='fleet.lua' and 'fleet' or name=='fleet_admin.lua' and 'admin' or 'startup'
-        local old=i.files and i.files[key] and i.files[key].size or 0
-        need=need+#proposed[name]+2*old;maxSize=math.max(maxSize,old,#proposed[name])
+      local i=before[id]
+      if needsBootstrap(i) then
+        log(id,'BOOTSTRAP','Manager/storage status requires r16 bootstrap before final preflight')
+      else
+        local need=nodeSpaceNeed(i);local available=i.storage.free
+        assert(available=='unlimited' or finite(available) and available>=need,'ID '..tostring(ROLE.resolve(id) or id)..' Out of space / storage preflight failed: need '..need..' bytes, free '..tostring(available)..', short '..(type(available)=='number' and math.max(0,need-available) or need)..' bytes')
       end
-      need=need+2*maxSize
-      local available=i.storage and i.storage.free
-      assert(available=='unlimited' or finite(available) and available>=need,'ID '..tostring(ROLE.resolve(id) or id)..' Out of space / storage preflight failed: need '..need..' bytes, free '..tostring(available)..', short '..(type(available)=='number' and math.max(0,need-available) or need)..' bytes; upgrade manager manually if storage status unavailable')
     end
   end)
   if not preflightOK then return false,'Preflight: '..tostring(preflightError)..'; files untouched; SHIP STOPPED' end
@@ -478,10 +494,10 @@ local function updateFleet(command)
     print('ROLLBACK... '..restored..'/'..total..' RESTORED')
     return false,reason..'; SHIP REMAINS STOPPED'
   end
-  phase('BACKUP')
+  phase('BOOTSTRAP')
   for _,id in ipairs(command.targets) do
-    if not before[id].capabilities or before[id].capabilities.bundle~=1 then
-      local i=before[id]
+    local i=before[id]
+    if needsBootstrap(i) then
       if not transfer(id,'fleet_hold.lua','return true',checksum('return true')) then return rollback('Bootstrap hold marker failed') end
       local ok,startInfo=transfer(id,'startup.lua',data['startup_node.lua'],sums['startup_node.lua'])
       if not ok then return rollback('Bootstrap startup failed') end
@@ -498,6 +514,15 @@ local function updateFleet(command)
     end
   end
   local manifest={{name='fleet.lua',checksum=sums['fleet.lua'],size=#data['fleet.lua']},{name='fleet_admin.lua',checksum=sums['fleet_admin.lua'],size=#data['fleet_admin.lua']},{name='startup.lua',checksum=sums['startup_node.lua'],size=#data['startup_node.lua']}}
+  phase('PREFLIGHT')
+  many(function(id)
+    if not call(id,'UPDATE_PREFLIGHT',{files=manifest,grounded=true}) then failed=true end
+  end)
+  if failed then
+    if FLEET15 and FLEET15.rollbackSelf then pcall(FLEET15.rollbackSelf) end
+    return false,'Storage preflight failed after manager bootstrap; SHIP STOPPED'
+  end
+  phase('BACKUP')
   many(function(id)
     prepared[id]=true
     local r=call(id,'UPDATE_PREPARE',{token=token,checksum=sums['fleet.lua'],files=manifest,grounded=true})
