@@ -81,7 +81,7 @@ local function discoverFine(strict)
   return names
 end
 local ROLE=FLEET_ROLES or (args[1]~='test_api' and newRoles() or nil)
-local ADMIN_VERSION='2026.10.19-r14'
+local ADMIN_VERSION='2026.10.20-r16'
 local REQUEST=42615
 local RESPONSE=42616
 local MAGIC='fleet_admin_v1'
@@ -173,13 +173,13 @@ local function network(id)
   return {scan=scan,send=send,envelope=envelope,valid=valid,close=close}
 end
 
-local function replaceFile(stage,name,expected,cancelled)
+local function replaceFile(stage,name,expected,cancelled,retained)
   local data=readFile(stage)
   assert(checksum(data,true)==expected,'Staged checksum changed')
   assert(not cancelled or not cancelled(),'Transfer cancelled')
-  local backup=name..'.bak.'..uid()
+  local backup=retained or name..'.bak.'..uid()
   local old=fs.exists(name)
-  if old then fs.copy(name,backup) end
+  if retained then assert(fs.exists(retained),'Transaction backup missing')elseif old then fs.copy(name,backup)end
   assert(not cancelled or not cancelled(),'Transfer cancelled')
   local journal={name=name,stage=stage,backup=old and backup or nil,checksum=expected,hadOld=old}
   local written,writeError=pcall(writeFile,'.fleet-admin-commit',textutils.serialize(journal))
@@ -198,7 +198,7 @@ local function replaceFile(stage,name,expected,cancelled)
     error(tostring(err)..(restored and ' / previous file restored' or ' / RECOVERY REQUIRED: '..tostring(why)),0)
   end
   pcall(fs.delete,'.fleet-admin-commit')
-  return backup
+  return (old or retained) and backup or nil
 end
 local function recover()
   if not fs.exists('.fleet-admin-commit') then return end
@@ -226,8 +226,48 @@ local function saveUpdate(t)
   if fs.exists(TXPATH) then fs.delete(TXPATH) end
   fs.move(TXPATH..'.new',TXPATH)
 end
+local BOOTPATH='fleet_boot_recovery.txt'
+local function loadBootstrap()
+  if not fs.exists(BOOTPATH)then return nil end
+  local root=textutils.unserialize(readFile(BOOTPATH));local originals,visited={},{}
+  local function collect(b,depth)
+    assert(depth<=8 and type(b)=='table' and b.kind=='fleet_bootstrap_v1' and type(b.token)=='string' and type(b.files)=='table','MANUAL RECOVERY REQUIRED: invalid bootstrap journal')
+    assert(not b.parents or type(b.parents)=='table' and #b.parents<=8,'Invalid bootstrap journal ancestry')
+    for _,parent in ipairs(b.parents or {})do
+      local path=type(parent)=='table' and parent.path or parent
+      assert(type(path)=='string' and path:match('^fleet_boot_recovery%.txt%.bak%.[%w%.%-]+$') and not visited[path],'Invalid/cyclic bootstrap journal ancestry')
+      visited[path]=true
+      if fs.exists(path)then collect(textutils.unserialize(readFile(path)),depth+1)
+      else assert(type(parent)=='table' and parent.optional==true,'Missing bootstrap parent journal')end
+    end
+    local seen={}
+    for _,f in ipairs(b.files)do
+      assert((f.name=='startup.lua' or f.name=='fleet_admin.lua') and not seen[f.name],'Invalid bootstrap rollback filename');seen[f.name]=true
+      assert(type(f.hadOld)=='boolean','Invalid bootstrap original state')
+      if f.hadOld then assert(type(f.backup)=='string' and f.backup:match('^[%w_%-]+%.lua%.bak%.[%w%.%-]+$') and type(f.oldChecksum)=='string','Invalid bootstrap backup')end
+      if not originals[f.name]then originals[f.name]=f end
+    end
+  end
+  collect(root,0);root.files={}
+  for _,name in ipairs({'startup.lua','fleet_admin.lua'})do if originals[name]then root.files[#root.files+1]=originals[name]end end
+  return root
+end
+local function restoreBootstrap(token)
+  local b=loadBootstrap();if not b then return 'No pending update' end
+  assert(not token or token==b.token,'Bootstrap token mismatch')
+  for _,f in ipairs(b.files)do if f.hadOld then assert(fs.exists(f.backup) and checksum(readFile(f.backup),true)==f.oldChecksum,'Bootstrap backup missing/corrupt: '..f.name)end end
+  for _,f in ipairs(b.files)do
+    if f.hadOld then
+      writeFile('.fleet-update-restore',readFile(f.backup))
+      if fs.exists(f.name)then fs.delete(f.name)end;fs.move('.fleet-update-restore',f.name)
+      assert(checksum(readFile(f.name),true)==f.oldChecksum,'Bootstrap restore mismatch: '..f.name)
+    elseif fs.exists(f.name)then fs.delete(f.name)end
+  end
+  fs.delete(BOOTPATH)
+  return 'Bootstrap originals restored; service remains in RAM; control stopped'
+end
 local function restoreUpdate()
-  local t=loadUpdate();if not t then return 'No pending update' end
+  local t=loadUpdate();if not t then return restoreBootstrap() end
   local files=t.files or {t}
   for _,f in ipairs(files) do
     assert(f.name=='fleet.lua' or f.name=='fleet_admin.lua' or f.name=='startup.lua','Invalid rollback filename')
@@ -246,6 +286,7 @@ local function restoreUpdate()
       elseif fs.exists(f.name) then fs.delete(f.name) end
     end
   end
+  if fs.exists(BOOTPATH)then fs.delete(BOOTPATH)end
   fs.delete(TXPATH)
   if fs.exists(TXPATH..'.new') then fs.delete(TXPATH..'.new') end
   return 'Previous file restored; control remains stopped'
@@ -256,16 +297,28 @@ local function recoverUpdate()
 end
 
 local function spaceRequired(manifest)
-  local needed,largest=32768,0
+  local backup,growth,largest=0,0,0
   assert(type(manifest)=='table' and #manifest>=1 and #manifest<=3,'Invalid preflight manifest')
-  local seen={}
+  local seen,originals={},{}
+  local bootstrap=loadBootstrap()
+  for _,f in ipairs(bootstrap and bootstrap.files or {})do originals[f.name]=f end
   for _,f in ipairs(manifest)do
     assert((f.name=='fleet.lua' or f.name=='fleet_admin.lua' or f.name=='startup.lua') and not seen[f.name],'Invalid preflight filename');seen[f.name]=true
-    assert(finite(f.size) and f.size>=0 and f.size<=1048576 and f.size%1==0,'Missing/invalid bundle size')
-    local old=fs.exists(f.name) and #readFile(f.name) or 0
-    needed=needed+f.size+2*old;largest=math.max(largest,f.size,old)
+    assert(finite(f.size) and f.size>0 and f.size<=1048576 and f.size%1==0,'Missing/invalid bundle size')
+    assert(type(f.checksum)=='string' and f.checksum:match('^%x%x%x%x%x%x%x%x$'),'Invalid preflight checksum')
+    local old=fs.exists(f.name) and readFile(f.name) or nil
+    local baseline=originals[f.name]
+    if baseline and baseline.hadOld then
+      assert(fs.exists(baseline.backup) and checksum(readFile(baseline.backup))==baseline.oldChecksum,'Bootstrap rollback backup invalid: '..f.name)
+      largest=math.max(largest,#readFile(baseline.backup))
+    end
+    if not old or checksum(old)~=f.checksum then
+      local oldSize=old and #old or 0
+      if not baseline or not baseline.hadOld then backup=backup+oldSize end
+      growth=growth+math.max(0,f.size-oldSize);largest=math.max(largest,f.size,oldSize)
+    end
   end
-  return needed+2*largest
+  return backup+growth+largest+32768
 end
 local function preflightSpace(manifest)
   local need=spaceRequired(manifest)
@@ -275,7 +328,7 @@ local function preflightSpace(manifest)
   assert(free=='unlimited' or free>=need,'Out of space: need '..need..' bytes, free '..tostring(free)..', short '..(type(free)=='number' and math.max(0,need-free) or 0)..' bytes')
   return {required=need,free=free}
 end
-if args[1]=='test_api' then return {spaceRequired=spaceRequired,preflightSpace=preflightSpace,checksum=checksum,validName=validName,replaceFile=replaceFile,recover=recover,loadUpdate=loadUpdate,restoreUpdate=restoreUpdate,recoverUpdate=recoverUpdate} end
+if args[1]=='test_api' then return {spaceRequired=spaceRequired,preflightSpace=preflightSpace,checksum=checksum,validName=validName,replaceFile=replaceFile,recover=recover,loadUpdate=loadUpdate,restoreUpdate=restoreUpdate,loadBootstrap=loadBootstrap,restoreBootstrap=restoreBootstrap,recoverUpdate=recoverUpdate} end
 local id=ROLE.slot
 assert(isTarget(id),'fleet_admin runs on 10-14 / 16-19')
 local native=term.current()
@@ -367,7 +420,7 @@ local function snapshot()
   return {id=id,actualId=ROLE.actual,role=ROLE.role,roles=ROLE.snapshot(),boot=boot,state=flight.state,running=flight.co~=nil,active=active(),
     zero=zero,error=flight.error,runtime=flight.runtime,adminError=flight.adminError,adminVersion=ADMIN_VERSION,
     runningCode=flight.runVersion,runningAdmin=runningAdmin,nodeVersion=FLEET_NODE_VERSION,bootError=fs.exists('fleet_boot_error.txt') and readFile('fleet_boot_error.txt') or nil,files={fleet=fileVersion('fleet.lua'),admin=fileVersion('fleet_admin.lua'),startup=fileVersion('startup.lua')},
-    recovery=fs.exists('.fleet-admin-commit'),update=loadUpdate(),storage={free=fs.getFreeSpace and fs.getFreeSpace('')},capabilities={update=1,delete=1,bundle=1,boundedStop=1,maintenance=1,spacePreflight=1},time=now()}
+    recovery=fs.exists('.fleet-admin-commit'),update=loadUpdate(),bootstrap=loadBootstrap(),storage={free=fs.getFreeSpace and fs.getFreeSpace('')},capabilities={update=1,delete=1,bundle=1,boundedStop=1,maintenance=1,spacePreflight=2,bootstrap=1},time=now()}
 end
 local function service()
   local net=network(id)
@@ -443,7 +496,9 @@ local function service()
       local t={token=b.token,name='fleet.lua',checksum=b.checksum,state='PREPARED',secured=true,files={}}
       local manifest=b.files or {{name='fleet.lua',checksum=b.checksum}}
       assert(type(manifest)=='table' and #manifest>=1 and #manifest<=3,'Invalid bundle manifest')
-      local seen={}
+      local seen,originals={},{}
+      local bootstrap=loadBootstrap()
+      for _,f in ipairs(bootstrap and bootstrap.files or {})do originals[f.name]=f end
       for _,entry in ipairs(manifest) do
         local name=entry.name
         assert((name=='fleet.lua' or name=='fleet_admin.lua' or name=='startup.lua') and not seen[name],'Invalid/duplicate bundle filename')
@@ -451,11 +506,15 @@ local function service()
         assert(type(entry.checksum)=='string' and entry.checksum:match('^%x%x%x%x%x%x%x%x$'),'Invalid bundle checksum')
         local old=fileVersion(name)
         local f={name=name,checksum=entry.checksum,hadOld=old.exists,oldChecksum=old.checksum,changed=old.checksum~=entry.checksum}
-        if f.changed and f.hadOld then f.backup=name..'.bak.update-'..uid();fs.copy(name,f.backup) end
+        local original=originals[name]
+        if original then
+          f.hadOld=original.hadOld;f.oldChecksum=original.oldChecksum;f.backup=original.backup;f.changed=true
+          if f.hadOld then assert(fs.exists(f.backup) and checksum(readFile(f.backup),true)==f.oldChecksum,'Bootstrap backup invalid: '..name)end
+        elseif f.changed and f.hadOld then f.backup=name..'.bak.update-'..uid();fs.copy(name,f.backup)end
         t.files[#t.files+1]=f
       end
       assert(seen['fleet.lua'],'fleet.lua missing from manifest')
-      saveUpdate(t);respond(m,'PREPARED','Rollback copy retained',snapshot());return
+      saveUpdate(t);if bootstrap then fs.delete(BOOTPATH)end;respond(m,'PREPARED','Rollback copy retained',snapshot());return
     end
     if m.op=='UPDATE_CHECK' or m.op=='UPDATE_COMMIT' then
       local t=assert(loadUpdate(),'No update transaction');assert(t.token==b.token,'Update token mismatch')
@@ -481,6 +540,7 @@ local function service()
     if m.op=='UPDATE_ROLLBACK' then
       assert(b.grounded==true,'Landed confirmation required')
       local t=loadUpdate();assert(not t or t.token==b.token,'Update token mismatch')
+      if not t and loadBootstrap()then assert(loadBootstrap().token==b.token,'Bootstrap token mismatch')end
       if controlJob then respond(controlJob.request,'FAILED','Preempted by rollback');controlJob=nil end
       stopTransfer();requestStop();controlJob={op='ROLLBACK',request=m,deadline=os.clock()+ZERO_TIMEOUT+4}
       respond(m,'RECEIVED','Stopping before restoring previous file');return
@@ -612,8 +672,12 @@ local function service()
           sleep(0)
           assert(not x.cancelled,'Transfer cancelled')
           x.phase='COMMITTING'
-          local backup=replaceFile(x.path,x.name,x.checksum,function()return x.cancelled end)
-          local tx=loadUpdate();if tx then tx.state='APPLIED';saveUpdate(tx) end
+          local tx=loadUpdate();local retained
+          for _,f in ipairs(tx and tx.files or {})do if f.name==x.name and f.changed and f.hadOld then
+            assert(fs.exists(f.backup) and checksum(readFile(f.backup),true)==f.oldChecksum,'Transaction backup checksum mismatch');retained=f.backup
+          end end
+          local backup=replaceFile(x.path,x.name,x.checksum,function()return x.cancelled end,retained)
+          tx=loadUpdate();if tx then tx.state='APPLIED';saveUpdate(tx) end
           respond(w.request,'APPLIED','File replaced; running code not restarted',{name=x.name,checksum=x.checksum,backup=backup})
         end)
         if not ok then respond(w.request,'FAILED',tostring(err));pcall(fs.delete,x.path) end
@@ -629,7 +693,7 @@ local function service()
       if transfer and not work and os.clock()-transfer.seen>30 then stopTransfer() end
       local job=controlJob
       if job then
-        if job.op=='ROLLBACK' and stoppedSafe() then
+        if job.op=='ROLLBACK' and stoppedSafe() and not work then
           local ok,why=pcall(restoreUpdate);respond(job.request,ok and 'ROLLED_BACK' or 'FAILED',tostring(why),snapshot());if controlJob==job then controlJob=nil end
         elseif job.op=='STOP' and stoppedSafe() then
           respond(job.request,'STOPPED','Output zero writes acknowledged; admin alive',snapshot());if controlJob==job then controlJob=nil end

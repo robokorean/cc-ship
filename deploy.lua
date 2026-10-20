@@ -380,7 +380,7 @@ local function updateFleet(command)
   end
   for _,id in ipairs(TARGETS) do local found=false;for _,n in ipairs(command.targets) do found=found or n==id end;assert(found,'UPDATE requires all flight nodes') end
   if not command.grounded then write('SHIP MUST BE LANDED / SECURED. Type LANDED: ');assert(read()=='LANDED','Cancelled') end
-  local token=uid();local before={};local prepared={};local failed=false;local data={};local sums={}
+  local token=uid();local before={};local prepared={};local bootstrapJobs={};local failed=false;local data={};local sums={}
   local function stopAll()
     local ok=call(10,'STOP',{})~=nil
     many(function(id)if id~=10 and not call(id,'STOP',{}) then ok=false end end)
@@ -406,20 +406,6 @@ local function updateFleet(command)
     return not i or not i.capabilities or i.capabilities.bundle~=1 or i.capabilities.spacePreflight~=2
       or not i.storage or i.storage.free==nil
   end
-  local function nodeSpaceNeed(i)
-    local backup,growth,largest=0,0,0
-    for _,name in ipairs({'fleet.lua','fleet_admin.lua','startup_node.lua'})do
-      local key=name=='fleet.lua' and 'fleet' or name=='fleet_admin.lua' and 'admin' or 'startup'
-      local f=i.files and i.files[key]
-      local old=f and finite(f.size) and f.size or 0
-      if not f or f.checksum~=sums[name] then
-        backup=backup+old
-        growth=growth+math.max(0,#proposed[name]-old)
-        largest=math.max(largest,#proposed[name])
-      end
-    end
-    return backup+growth+largest+32768
-  end
   phase('PREFLIGHT')
   local preflightOK,preflightError=pcall(function()
     assert(fs.exists('startup.lua'),'startup.lua missing; install startup_15.lua as startup.lua')
@@ -430,8 +416,9 @@ local function updateFleet(command)
       if needsBootstrap(i) then
         log(id,'BOOTSTRAP','Manager/storage status requires r16 bootstrap before final preflight')
       else
-        local need=nodeSpaceNeed(i);local available=i.storage.free
-        assert(available=='unlimited' or finite(available) and available>=need,'ID '..tostring(ROLE.resolve(id) or id)..' Out of space / storage preflight failed: need '..need..' bytes, free '..tostring(available)..', short '..(type(available)=='number' and math.max(0,need-available) or need)..' bytes')
+        local manifest={{name='fleet.lua',size=#proposed['fleet.lua'],checksum=sums['fleet.lua']},{name='fleet_admin.lua',size=#proposed['fleet_admin.lua'],checksum=sums['fleet_admin.lua']},{name='startup.lua',size=#proposed['startup_node.lua'],checksum=sums['startup_node.lua']}}
+        local r=call(id,'UPDATE_PREFLIGHT',{files=manifest,grounded=true})
+        assert(r,'ID '..tostring(ROLE.resolve(id) or id)..' storage preflight failed')
       end
     end
   end)
@@ -471,6 +458,7 @@ local function updateFleet(command)
       local r=call(id,'STATUS',{},true);local i=r and r.info
       if i and i.boot~=oldBoot and i.capabilities and i.capabilities.bundle==1 then
         if expected and (not i.runningAdmin or i.runningAdmin.checksum~=expected) then log(id,'FAILED','New management runtime checksum mismatch: '..tostring(i.bootError or 'previous manager restored'));return false end
+        if i.capabilities.spacePreflight~=2 or not i.storage or not (i.storage.free=='unlimited' or finite(i.storage.free)) then log(id,'FAILED','New manager did not report real storage.free / spacePreflight=2');return false end
         before[id]=i;return true
       end
     end
@@ -485,11 +473,25 @@ local function updateFleet(command)
       if prepared[id] then
         local r=call(id,'UPDATE_ROLLBACK',{token=token,grounded=true})
         outcomes[id].rollback=r and 'RESTORED' or 'MANUAL RECOVERY REQUIRED'
+      elseif bootstrapJobs[id] then
+        local job=bootstrapJobs[id];local status=call(id,'STATUS',{},true);local info=status and status.info
+        if info and info.capabilities and info.capabilities.bootstrap==1 then
+          local r=call(id,'UPDATE_ROLLBACK',{token=token,grounded=true})
+          outcomes[id].rollback=r and 'RESTORED' or 'MANUAL RECOVERY REQUIRED'
+        else
+          local restored=info and not info.running and info.active==false
+          for _,key in ipairs({'admin','startup'})do
+            local old=job.before.files and job.before.files[key];local disk=info and info.files and info.files[key]
+            restored=restored and old and disk and old.exists==disk.exists and old.checksum==disk.checksum
+          end
+          outcomes[id].rollback=restored and 'RESTORED' or 'MANUAL RECOVERY REQUIRED'
+          if not restored then log(id,'FAILED','MANUAL RECOVERY REQUIRED: bootstrap interrupted before new service available; originals/backups retained')end
+        end
       end
       if errors[id] then log(id,'FAILED',errors[id]..' / '..(outcomes[id].rollback or 'STOPPED')) end
     end)
     local restored,total=0,0
-    for id in pairs(prepared)do total=total+1;if outcomes[id] and outcomes[id].rollback=='RESTORED' then restored=restored+1 else print('MANUAL RECOVERY REQUIRED: '..tostring(ROLE.resolve(id) or id)) end end
+    for id in pairs(outcomes)do if prepared[id] or bootstrapJobs[id]then total=total+1;if outcomes[id].rollback=='RESTORED'then restored=restored+1 else print('MANUAL RECOVERY REQUIRED: '..tostring(ROLE.resolve(id) or id))end end end
     if FLEET15 and FLEET15.rollbackSelf then local ok,why=pcall(FLEET15.rollbackSelf);if not ok then print('MANUAL RECOVERY REQUIRED: 15 '..tostring(why)) end end
     print('ROLLBACK... '..restored..'/'..total..' RESTORED')
     return false,reason..'; SHIP REMAINS STOPPED'
@@ -498,19 +500,34 @@ local function updateFleet(command)
   for _,id in ipairs(command.targets) do
     local i=before[id]
     if needsBootstrap(i) then
-      if not transfer(id,'fleet_hold.lua','return true',checksum('return true')) then return rollback('Bootstrap hold marker failed') end
-      local ok,startInfo=transfer(id,'startup.lua',data['startup_node.lua'],sums['startup_node.lua'])
-      if not ok then return rollback('Bootstrap startup failed') end
-      local adminOK,adminInfo=transfer(id,'fleet_admin.lua',data['fleet_admin.lua'],sums['fleet_admin.lua'])
-      if not adminOK then return rollback('Bootstrap manager failed') end
-      local bootRecovery={state='RESTARTING',files={
-        {name='fleet_admin.lua',hadOld=adminInfo and adminInfo.backup~=nil,backup=adminInfo and adminInfo.backup,oldChecksum=i.files and i.files.admin and i.files.admin.checksum},
-        {name='startup.lua',hadOld=startInfo and startInfo.backup~=nil,backup=startInfo and startInfo.backup}}}
-      local cookie=textutils.serialize(bootRecovery)
-      if not transfer(id,'fleet_boot_recovery.txt',cookie,checksum(cookie)) then return rollback('Bootstrap recovery marker failed') end
-      if not call(id,'REBOOT',{grounded=true}) or not booted(id,i.boot,sums['fleet_admin.lua']) then return rollback('Legacy management restart failed') end
-      if not call(id,'STOP',{}) then return rollback('New manager could not confirm zero') end
-      if not call(id,'UPDATE_RECOVER',{grounded=true}) then return rollback('New manager recovery failed') end
+      local cookie={kind='fleet_bootstrap_v1',token=token,state='RESTARTING',files={}}
+      bootstrapJobs[id]={before=i}
+      if not transfer(id,'fleet_hold.lua','return true',checksum('return true'))then return rollback('Bootstrap hold marker failed')end
+      local function saveCookie()
+        local body=textutils.serialize(cookie)
+        return transfer(id,'fleet_boot_recovery.txt',body,checksum(body))
+      end
+      local journalOK,priorJournal=saveCookie()
+      if not journalOK then return rollback('Bootstrap journal creation failed')end
+      if priorJournal and priorJournal.backup then
+        cookie.parents={{path=priorJournal.backup,optional=true}}
+        if not saveCookie()then return rollback('Bootstrap parent journal preservation failed')end
+      end
+      for _,entry in ipairs({{name='startup.lua',source='startup_node.lua',key='startup'},{name='fleet_admin.lua',source='fleet_admin.lua',key='admin'}})do
+        local old=i.files and i.files[entry.key]
+        if not old or old.checksum~=sums[entry.source]then
+          local ok,result=transfer(id,entry.name,data[entry.source],sums[entry.source])
+          if not ok then return rollback('Bootstrap '..entry.name..' failed')end
+          local hadOld=old and old.exists==true or false
+          if hadOld and not (result and result.backup and old.checksum)then return rollback('Bootstrap original backup not acknowledged')end
+          cookie.files[#cookie.files+1]={name=entry.name,hadOld=hadOld,backup=result and result.backup,oldChecksum=old and old.checksum}
+          if not saveCookie()then return rollback('Bootstrap rollback journal update failed')end
+        end
+      end
+      if not call(id,'REBOOT',{grounded=true}) or not booted(id,i.boot,sums['fleet_admin.lua'])then return rollback('Bootstrap manager reboot verification failed')end
+      local stopped=call(id,'STOP',{})
+      if not stopped or not stopped.info or stopped.info.active~=false or not stopped.info.zero or stopped.info.zero.state~='OK'then return rollback('Bootstrap manager could not confirm output zero')end
+      before[id]=stopped.info
     end
   end
   local manifest={{name='fleet.lua',checksum=sums['fleet.lua'],size=#data['fleet.lua']},{name='fleet_admin.lua',checksum=sums['fleet_admin.lua'],size=#data['fleet_admin.lua']},{name='startup.lua',checksum=sums['startup_node.lua'],size=#data['startup_node.lua']}}
@@ -518,10 +535,7 @@ local function updateFleet(command)
   many(function(id)
     if not call(id,'UPDATE_PREFLIGHT',{files=manifest,grounded=true}) then failed=true end
   end)
-  if failed then
-    if FLEET15 and FLEET15.rollbackSelf then pcall(FLEET15.rollbackSelf) end
-    return false,'Storage preflight failed after manager bootstrap; SHIP STOPPED'
-  end
+  if failed then return rollback('Storage preflight failed after verified manager bootstrap; fleet code not applied')end
   phase('BACKUP')
   many(function(id)
     prepared[id]=true
