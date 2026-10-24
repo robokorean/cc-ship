@@ -82,7 +82,7 @@ local function discoverFine(strict)
   return names
 end
 local ROLE=FLEET_ROLES or (args[1]~='test_api' and newRoles() or nil)
-local VERSION='2026.10.24-r17'
+local VERSION='2026.10.24-r19'
 local PAGE_COUNT=17
 local PAGE_NAMES={'PROPULSION','ANGLES','SENSORS','VECTOR STATUS','NODES','CRUISE / NAV','STATUS / PILOT','ADMIN','HOVER','MANUAL','TEST','WEAPONS','FACILITY','RADAR','LOG / ALERT','CONSOLES','ENGINEERING'}
 local CHANNEL=42110
@@ -259,10 +259,12 @@ local function navDisplay(t,g,now)
     error=trusted and finite(nav.courseError) and string.format('%+.1f deg',nav.courseError) or '?',
     hint=not nav.active and 'Navigation inactive' or nav.rechecking and 'RECHECKING COURSE...' or nav.stage=='PROBE' and 'Finding course...' or trusted and 'GPS COURSE ESTIMATE' or 'Course unknown',
     yawValid=yawValid,yaw=yawValid and y.yaw or nil,targetYaw=bearing,
-    bowReason=y and y.reason,bowSamples=y and y.samples,bowSign=y and y.bowSign,
+    bowReason=y and y.reason,bowSamples=y and y.samples,bowSign=y and y.bowSign,bowSignSource=y and y.bowSignSource,
     bowX=yawValid and math.cos(math.rad(y.yaw)) or 0,bowZ=yawValid and math.sin(math.rad(y.yaw)) or 0,
     warnings=nav.directionDiagnostics and nav.directionDiagnostics.warnings or {},actualCourse=actualCourse,
-    yawError=yawValid and y.error or nil,yawRate=yawValid and y.rateValid and y.rate or nil,yawFixes=y and y.fixes or 0,yawRequired=y and y.required or 2,baseline=y and y.baseline,rawYaw=y and y.rawYaw,offset=y and y.offset,
+    yawError=yawValid and y.error or nil,yawRate=yawValid and y.rateValid and y.rate or nil,yawFixes=y and y.fixes or 0,yawRequired=y and y.required or 2,
+    baseline=y and y.horizontalBaseline or y and y.baseline,distance3d=y and y.distance3d,distanceError=y and y.distanceError,deltaY=y and y.deltaY,
+    recoveryFixes=y and y.recoveryFixes,recoveryRequired=y and y.recoveryRequired,rawYaw=y and y.rawYaw,offset=y and y.offset,
     velocity=nav.velocity or {},limits=nav.limits or {},
     turn=nav.turnDirection or 'NONE',boost=nav.boostApplied or nav.turnBoost or 0,
     probeAngle=nav.probeInfo and nav.probeInfo.angle or nav.probeAngle,
@@ -503,8 +505,8 @@ local function draw(screen,model,now,page,radio,offset,navMode)
           put(2,20,string.format('VEL F:%s L:%s V:%s',finite(vel.forward) and string.format('%.1f',vel.forward) or '?',finite(vel.lateral) and string.format('%.1f',vel.lateral) or '?',finite(vel.vertical) and string.format('%.1f',vel.vertical) or '?'),'5')
         else put(2,20,'GPS '..d.gps..' / ARM '..(t and t.armed and 'ON' or 'OFF'),'8') end
         if w>=60 and h>=27 then
-          put(2,21,string.format('12/13 BASE %s RAW(+1) %s SIGN %s OFF %s',finite(d.baseline) and string.format('%.1f',d.baseline) or '?',finite(d.rawYaw) and string.format('%.1f',d.rawYaw) or '?',tostring(d.bowSign or 'UNVERIFIED'),tostring(d.offset or 0)),'8')
-          put(2,22,d.yawValid and ('CRS ERR '..d.error..' / '..d.hint) or d.hint,'4')
+          put(2,21,string.format('12/13 3D %s H %s dY %s RAW %s',finite(d.distance3d) and string.format('%.2f',d.distance3d) or '?',finite(d.baseline) and string.format('%.2f',d.baseline) or '?',finite(d.deltaY) and string.format('%+.2f',d.deltaY) or '?',finite(d.rawYaw) and string.format('%.1f',d.rawYaw) or '?'),'8')
+          put(2,22,d.yawValid and ('CRS ERR '..d.error..' / '..d.hint) or ((finite(d.recoveryFixes) and finite(d.recoveryRequired)) and ('BOW HOLD '..d.recoveryFixes..'/'..d.recoveryRequired..' / '..d.hint) or d.hint),'4')
           local cx=math.floor(w/2);local cy=23
           put(cx,cy,'O','0');put(cx+12,cy,'X+','8');put(cx-2,cy+2,'Z+','8')
           put(cx+d.tx*8,cy+d.tz,'T','4');put(cx+d.ax*6,cy+d.az,'A','5')
