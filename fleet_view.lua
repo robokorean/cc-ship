@@ -82,7 +82,7 @@ local function discoverFine(strict)
   return names
 end
 local ROLE=FLEET_ROLES or (args[1]~='test_api' and newRoles() or nil)
-local VERSION='2026.10.24-r19'
+local VERSION='2026.10.25-r20'
 local PAGE_COUNT=17
 local PAGE_NAMES={'PROPULSION','ANGLES','SENSORS','VECTOR STATUS','NODES','CRUISE / NAV','STATUS / PILOT','ADMIN','HOVER','MANUAL','TEST','WEAPONS','FACILITY','RADAR','LOG / ALERT','CONSOLES','ENGINEERING'}
 local CHANNEL=42110
@@ -485,9 +485,15 @@ local function draw(screen,model,now,page,radio,offset,navMode)
         else
           put(2,11,'BOW ? / '..tostring(d.bowReason or 'GPS DEGRADED'),'4')
           put(2,12,'TARGET '..(finite(d.targetYaw) and string.format('%.1f',d.targetYaw) or '?')..' / CRS ERR '..d.error,'8')
-          put(2,13,'PROBE ANGLE: '..(finite(d.probeAngle) and string.format('%g deg',d.probeAngle) or '?'),'4')
-          put(2,14,'MOVE:'..(finite(d.probeMove) and string.format('%.2fb',d.probeMove) or '?')..' FIXES:'..(finite(d.probeFixes) and tostring(d.probeFixes) or '?')..(d.probeLast and ' LAST' or ''),'8')
-          put(2,15,'RETRY: '..d.retry..' / GPS: '..d.gps,'4')
+          if nav and nav.courseContinuing then
+            put(2,13,'COURSE DRIVE / EXTRA ACCEL HELD','5')
+            put(2,14,'CRS ERROR '..d.error..' / AGE '..(finite(nav.courseAge) and string.format('%.1fs',nav.courseAge) or '?'),'8')
+            put(2,15,'BOW RECOVERY '..tostring(d.recoveryFixes or 0)..'/'..tostring(d.recoveryRequired or 3)..' / GPS '..d.gps,'4')
+          else
+            put(2,13,'PROBE ANGLE: '..(finite(d.probeAngle) and string.format('%g deg',d.probeAngle) or '?'),'4')
+            put(2,14,'MOVE:'..(finite(d.probeMove) and string.format('%.2fb',d.probeMove) or '?')..' FIXES:'..(finite(d.probeFixes) and tostring(d.probeFixes) or '?')..(d.probeLast and ' LAST' or ''),'8')
+            put(2,15,'RETRY: '..d.retry..' / GPS: '..d.gps,'4')
+          end
         end
         put(2,16,#d.warnings>0 and table.concat(d.warnings,' / ') or nav and nav.reason or '', #d.warnings>0 and 'e' or '8')
         if nav and nav.landing then

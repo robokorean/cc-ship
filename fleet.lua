@@ -83,7 +83,7 @@ local function discoverFine(strict)
   return names
 end
 local ROLE=FLEET_ROLES or (args[1]~='test_api' and newRoles() or nil)
-local VERSION='2026.10.24-r19'
+local VERSION='2026.10.25-r20'
 local CFG={tick=0.05,finePower=1,nodeTimeout=1,commandTimeout=3,
   stopWriteTimeout=0.75,
   relayTimeout=0.5,assistDelay=3,assistRise=1,releaseRate=8,mainSlew=4,
@@ -93,9 +93,9 @@ local NAVCFG={courseVerified=true,yawSign=1,hoverMain=9,maxMain=10,maxVector=18,
   arrivalSpeed=0.5,arrivalHold=3,gpsTimeout=5,uiTimeout=3,mainRate=0.25,cruiseY=350,altitudeBand=20,safetyDrop=80,stableVertical=1,
   stableTilt=5,stableRate=3,stabilizeSeconds=3,probeVector=24,probeSeconds=4,probeHoldSeconds=3,
   probeFixes=2,probeDistance=1,probeMaxSpeed=1.5,courseTimeout=5,
-  alignDegrees=15,turnSeconds=3,brakeVector=6}
+  alignDegrees=15,turnSeconds=3,brakeVector=6,courseDriveEnter=15,courseDriveExit=25,courseDriveAge=2}
 local YAWCFG={bodyIds={12,13},bowSign=1,bowSignSource='DEFAULT_LEFT_RIGHT_UP',yawOffset=0,maxAge=2,maxSkew=0.25,
-  mountDistance=5,mountTolerance=0.75,minHorizontal=1.5,recoverFixes=3,maxTilt=70,
+  mountDistance=4,mountTolerance=0.75,minHorizontal=1.5,recoverFixes=3,maxTilt=70,
   maxRate=120,rateFilter=0.4,alignError=5,exitError=10,settleRate=2,alignSeconds=1,
   prediction=1,fineBand=15,maxVector=24,vectorRate=12,maxBoost=1,boostRise=0.5,boostFall=2,
   slipDegrees=60,slipSpeed=1,gpsLocateTimeout=2.5,gpsPollSeconds=0.5}
@@ -587,8 +587,24 @@ local function yawPose(nodes,target,time,track,position,attitude)
   end
   if q.fixes~=2 then return latchInvalid('YAW_GPS_DEGRADED','12 '..q.samples[12].state..' / 13 '..q.samples[13].state)end
   q.oldest=oldest;q.skew=(newest-oldest)/1000
-  if q.skew>YAWCFG.maxSkew then return latchInvalid('YAW_GPS_DEGRADED','12/13 GPS sample skew')end
   local left,right=points[12],points[13];q.left=left;q.right=right
+  local candidate=track.candidateTimes
+  if candidate and (left.time<candidate[12] or right.time<candidate[13]) then
+    return latchInvalid('YAW_GPS_DEGRADED','12/13 out-of-order GPS frame')
+  end
+  local complete=not candidate or (left.time>candidate[12] and right.time>candidate[13])
+  if not complete then
+    local prior=track.pose
+    if prior and time-prior.oldest<=YAWCFG.maxAge*1000 and track.recovering==false then
+      local pendingSamples=q.samples
+      for k,v in pairs(prior)do q[k]=v end
+      q.pending=true;q.pendingSamples=pendingSamples
+      return finish()
+    end
+    q.pending=true;q.reasonCode='YAW_RECOVERING';q.reason='Waiting for complete new 12/13 pair'
+    return q
+  end
+  if q.skew>YAWCFG.maxSkew then return latchInvalid('YAW_GPS_DEGRADED','12/13 GPS sample skew')end
   q.center={x=(left.x+right.x)/2,y=(left.y+right.y)/2,z=(left.z+right.z)/2}
   local dx,dy,dz=right.x-left.x,right.y-left.y,right.z-left.z
   q.lr={x=dx,y=dy,z=dz};q.deltaY=dy
@@ -723,6 +739,7 @@ local function speedGuard(left,right,v)
 end
 local function resetCruise(nav)
   nav.directionLock=false;nav.directionLockSince=nil;nav.motionEstablished=false
+  nav.courseContinuing=false;nav.courseDriveSince=nil;nav.courseHoldSpeed=nil;nav.turnInPlace=false;nav.turnSide=nil
   nav.targetForward=0;nav.cruiseIntegral=0;nav.cruiseDemand=0;nav.cruiseVector=0;nav.cruiseInitialized=false
   nav.brakeSample=nil;nav.slipFactor=1;nav.slipSevere=false;nav.accelerationAllowed=nil
 end
@@ -795,7 +812,10 @@ local function cruiseCommand(nav,m,dt)
   local permit=nav.accelerationAllowed~=false and not nav.altitudeLimited
   local lateral=math.abs(m.lateral or 0)
   local old=nav.targetForward or math.max(0,math.min(v,VELCFG.cruiseSpeed))
-  if nav.motionEstablished and not permit and lateral<CRUISECFG.slipSevere and not nav.slipSevere then old=math.max(0,v);goal=math.max(goal,old) end
+  if nav.motionEstablished and not permit and lateral<CRUISECFG.slipSevere and not nav.slipSevere then
+    old=nav.courseContinuing and math.min(old,nav.courseHoldSpeed or v) or math.max(0,v);goal=math.max(goal,old)
+  end
+  if nav.courseContinuing then goal=math.min(goal,nav.courseHoldSpeed or v) end
   goal=math.min(goal,VELCFG.forwardLimit,ceiling)
   if lateral<=CRUISECFG.slipNormal then nav.slipSevere=false
   elseif lateral>=CRUISECFG.slipSevere then nav.slipSevere=true
@@ -813,6 +833,7 @@ local function cruiseCommand(nav,m,dt)
   nav.targetForward=old+clamp(goal-old,-fall*dt,accel*dt)
   if distanceBrake then nav.targetForward=math.min(nav.targetForward,ceiling) end
   nav.targetForward=clamp(nav.targetForward,0,VELCFG.forwardLimit)
+  if nav.courseContinuing then nav.courseHoldSpeed=math.min(nav.courseHoldSpeed or v,nav.targetForward) end
   nav.distanceTarget=goal;nav.accelerationLimited=not permit or lateral>CRUISECFG.slipNormal
   local error=nav.targetForward-v
   local effective=math.abs(error)<=CRUISECFG.speedDeadband and 0 or error
@@ -827,7 +848,7 @@ local function cruiseCommand(nav,m,dt)
   if demand>CRUISECFG.holdVector and lateral>CRUISECFG.slipNormal then
     demand=CRUISECFG.holdVector+(demand-CRUISECFG.holdVector)*nav.slipFactor
   end
-  if not permit and nav.motionEstablished then demand=math.min(demand,CRUISECFG.holdVector) end
+  if not permit and nav.motionEstablished and not nav.courseContinuing then demand=math.min(demand,CRUISECFG.holdVector) end
   if braking and v>NAVCFG.arrivalSpeed then demand=math.min(demand,-NAVCFG.brakeVector) end
   if not braking and nav.targetForward>0.05 then demand=math.max(demand,CRUISECFG.holdVector) end
   if gap==0 and nav.targetForward<=NAVCFG.arrivalSpeed and math.abs(v)<=NAVCFG.arrivalSpeed then demand=0 end
@@ -920,6 +941,26 @@ local function yawCommand(nav,pose,dt,time)
     nav.slipCorrection=clamp(-atanDeg((math.abs(m.lateral)-VELCFG.slipThreshold)*(m.lateral>=0 and 1 or -1),m.forward),-VELCFG.maxCrab,VELCFG.maxCrab)
     e=wrapAngle(e+nav.slipCorrection)
   end
+  local absolute=math.abs(e)
+  local autoTurn=nav.commandMode==nil or nav.commandMode=='CRUISE'
+  if autoTurn and absolute>=150 then
+    nav.turnSide=nav.turnSide or (e>=0 and 1 or -1)
+    if nav.turnSide>0 and e<0 then e=e+360 elseif nav.turnSide<0 and e>0 then e=e-360 end
+  elseif absolute<120 then nav.turnSide=nil end
+  if autoTurn and absolute>=90 then nav.turnInPlace=true end
+  if nav.turnInPlace then
+    nav.motionEstablished=false
+    nav.cruiseIntegral=0;nav.cruiseDemand=0;nav.cruiseVector=0;nav.cruiseInitialized=false;nav.targetForward=0
+    local v=m.forward
+    if not finite(v) and finite(m.horizontalSpeed) and m.horizontalSpeed<=NAVCFG.arrivalSpeed then v=0 end
+    if not finite(v) or math.abs(v)>NAVCFG.arrivalSpeed then
+      nav.turnBoost=0;nav.turnAngle=0;nav.yawAligned=false;nav.yawAlignSince=nil
+      nav.stage='YAW_TURN';nav.state='NAV TURN BRAKE';nav.turnDirection='BRAKE FIRST'
+      nav.reason='Target behind: slow before in-place yaw rotation'
+      local brake=finite(v) and (v>0 and -NAVCFG.brakeVector or NAVCFG.brakeVector) or 0
+      return brake,brake
+    end
+  end
   nav.controlYawError=e
   nav.accelerationAllowed=nav.directionLock==true and math.abs(e)<=CRUISECFG.lockError
     and math.abs(pose.rate or 0)<=CRUISECFG.lockRate
@@ -956,6 +997,7 @@ local function yawCommand(nav,pose,dt,time)
   nav.turnDirection=applied>0 and (NAVCFG.yawSign==1 and 'RIGHT' or 'LEFT')
     or applied<0 and (NAVCFG.yawSign==1 and 'LEFT' or 'RIGHT') or 'DAMP/HOLD'
   if nav.yawAligned then
+    nav.turnInPlace=false;nav.turnSide=nil
     nav.turnBoost=0;nav.turnAngle=0;nav.turnDirection='ALIGNED';nav.stage='CRUISE';nav.state='NAV CRUISE'
     nav.reason='Body baseline bow aligned; GPS course monitors motion'
     local m=nav.metrics or {}
@@ -999,6 +1041,38 @@ local function suspendGPS(nav)
   end
   nav.turnBoost=0;nav.turnAngle=0;nav.yawAligned=false;nav.yawAlignSince=nil
   nav.gpsPaused=true;nav.state='GPS DEGRADED';nav.reason='Horizontal hold; last good altitude command retained'
+end
+local function trackCourse(nav,m,now)
+  local eligible=nav.courseTrusted or nav.motionEstablished or nav.stage=='CRUISE'
+  local speed=m.gpsSpeed or m.horizontalSpeed
+  if eligible and nav.stage~='TURN' and nav.stage~='PROBE' and m.courseValid and finite(m.course)
+    and finite(speed) and speed>=NAVCFG.minCourseSpeed and finite(m.sampleTime)
+    and now-m.sampleTime>=-100 and now-m.sampleTime<=NAVCFG.courseDriveAge*1000
+    and (not nav.courseTime or m.sampleTime/1000>=nav.courseTime) then
+    nav.course=m.course;nav.courseTime=m.sampleTime/1000;nav.courseTrusted=true
+  end
+  if finite(nav.course) and finite(m.dx) and finite(m.dz) and m.dx*m.dx+m.dz*m.dz>0.0001 then
+    nav.courseError=wrapAngle(atanDeg(m.dz,m.dx)-nav.course)
+  end
+  nav.courseAge=finite(nav.courseTime) and now/1000-nav.courseTime or nil
+  return nav.courseTrusted==true and finite(nav.course) and finite(nav.courseTime)
+    and now/1000-nav.courseTime>=-0.1 and now/1000-nav.courseTime<=NAVCFG.courseDriveAge
+end
+local function continueCourse(nav,m,dt,now)
+  if nav.stage~='CRUISE' and not nav.courseContinuing then return nil end
+  local fresh=trackCourse(nav,m,now)
+  local limit=nav.courseContinuing and NAVCFG.courseDriveExit or NAVCFG.courseDriveEnter
+  local forward=m.forward
+  if not fresh or not finite(nav.courseError) or math.abs(nav.courseError)>limit
+    or not finite(forward) or forward<=NAVCFG.arrivalSpeed or not nav.attitudeStable then return nil end
+  if not nav.courseContinuing then nav.courseHoldSpeed=math.max(0,forward);nav.targetForward=nav.courseHoldSpeed end
+  nav.mode='COURSE';nav.stage='CRUISE';nav.state='NAV COURSE';nav.courseContinuing=true
+  nav.courseDriveSince=nav.courseDriveSince or now
+  nav.turnAngle=0;nav.turnBoost=0;nav.turnDirection='COURSE / NO BOW TURN'
+  nav.yawAligned=false;nav.yawAlignSince=nil;nav.directionLock=false;nav.directionLockSince=nil
+  nav.motionEstablished=true;nav.accelerationAllowed=false;nav.rechecking=false;nav.retryPending=false
+  nav.reason='BOW degraded; fresh safe COURSE maintains cruise, extra acceleration held'
+  return cruiseCommand(nav,m,dt)
 end
 local function verticalHold(nav,fix,m,goal,dt)
   nav.altitudeTarget=goal;nav.verticalSpeed=m.vy
@@ -1141,9 +1215,9 @@ local function navStep(nav,fix,previous,level,dt)
   nav.turnBoost=nav.turnBoost or 0
   nav.attitudeStable=not level.recovery and level.tilt<=NAVCFG.stableTilt and level.rate<=NAVCFG.stableRate
   local pose=level.yaw
-  if pose and pose.valid then
-    m.dx=nav.target.x-pose.center.x;m.dz=nav.target.z-pose.center.z
-    m.horizontal=math.sqrt(m.dx*m.dx+m.dz*m.dz);m.distance=math.sqrt(m.horizontal*m.horizontal+m.dy*m.dy)
+  if not (pose and pose.valid) then
+    nav.turnBoost=0;nav.turnAngle=0;nav.yawAligned=false;nav.yawAlignSince=nil
+    nav.directionLock=false;nav.directionLockSince=nil
   end
   if level.recovery then
     resetCruise(nav)
@@ -1204,12 +1278,8 @@ local function navStep(nav,fix,previous,level,dt)
     if nav.probeInfo then nav.probeInfo.result='ATTITUDE PAUSED' end
     navHold(nav,'Attitude priority: stabilize before course search');return 0,0
   end
-  if pose and pose.valid then nav.yawInvalidHeld=nil
-  elseif not nav.yawInvalidHeld then
-    nav.yawInvalidHeld=true;nav.mode='COURSE'
-    navHold(nav,'YAW INVALID: HOLD before course fallback');return 0,0
-  end
-  if m.courseValid and pose and pose.valid then nav.course=m.course;nav.courseTime=time;nav.courseError=m.error;nav.courseTrusted=true end
+  if m.courseValid and pose and pose.valid then nav.courseTrusted=true end
+  trackCourse(nav,m,level.now or fix.time)
   if m.horizontal<=NAVCFG.arrivalRadius then
     nav.turnBoost=0;nav.turnAngle=0;nav.state='NAV BRAKE';nav.stage='BRAKE';nav.reason='Slow before target-Y landing approach'
     if (m.horizontalSpeed or math.huge)<=NAVCFG.arrivalSpeed then nav.stage='FINAL';nav.landing=true;nav.holdStart=nil;return 0,0 end
@@ -1220,13 +1290,20 @@ local function navStep(nav,fix,previous,level,dt)
     end
     return nav.course and -NAVCFG.brakeVector or 0,nav.course and -NAVCFG.brakeVector or 0
   end
-  if pose and pose.valid then return yawCommand(nav,pose,dt,level.now or fix.time) end
-  if nav.mode=='YAW' then nav.mode='COURSE';navHold(nav,'YAW DEGRADED: HOLD before course fallback');return 0,0 end
+  if pose and pose.valid then
+    nav.courseContinuing=false;nav.courseDriveSince=nil;nav.courseHoldSpeed=nil
+    return yawCommand(nav,pose,dt,level.now or fix.time)
+  end
+  local l,r=continueCourse(nav,m,dt,level.now or fix.time)
+  if l~=nil then return l,r end
+  if nav.mode=='YAW' or nav.courseContinuing then
+    nav.mode='COURSE';navHold(nav,'No safe fresh COURSE: HOLD before course search');return 0,0
+  end
   nav.mode='COURSE';nav.turnBoost=0;nav.turnAngle=0
   local atan2=math.atan2 or function(y,x) return math.atan(y,x) end
   local function course(dx,dz)
     local tx,tz=nav.target.x-fix.x,nav.target.z-fix.z
-    nav.course=math.deg(atan2(dz,dx));nav.courseTime=time
+    nav.course=math.deg(atan2(dz,dx));nav.courseTime=fix.time/1000
     nav.courseError=math.deg(atan2(dx*tz-dz*tx,dx*tx+dz*tz));nav.courseTrusted=true;nav.rechecking=false
     nav.probeFailCount=0;nav.retryPending=false;nav.holdSince=nil;nav.holdProgress=0
   end
@@ -1260,7 +1337,7 @@ local function navStep(nav,fix,previous,level,dt)
     return NAVCFG.probeVector,NAVCFG.probeVector
   end
   if stage=='CRUISE' and m.courseValid then
-    nav.course=m.course;nav.courseTime=time;nav.courseError=m.error;nav.courseTrusted=true;nav.rechecking=false
+    nav.course=m.course;nav.courseTime=fix.time/1000;nav.courseError=m.error;nav.courseTrusted=true;nav.rechecking=false
     nav.probeFailCount=0;nav.retryPending=false
   end
   if nav.courseTime and time-nav.courseTime>NAVCFG.courseTimeout then nav.course=nil;nav.courseTrusted=false end
@@ -1385,7 +1462,7 @@ local function newBlackbox()
       fresh=fresh(m,1000),roles=m.roles,control={main=m.main,mainDemand=m.mainDemand,zones=control,vector=m.rotation,estimate=m.thrust},
       attitude={angles=m.angles,recovery=m.recovery,deadzone=m.deadzone,motion=m.attitudeMotion},nav={active=nav.active,mode=nav.commandMode,stage=nav.stage,state=nav.state,reason=nav.reason,
         gps=nav.gps,fix=nav.fix,target=nav.target,bow=nav.yaw,actual=nav.actual,course=nav.course,courseTrusted=nav.courseTrusted,courseError=nav.courseError,
-        targetForward=nav.targetForward,turnAngle=nav.turnAngle,turnBoost=nav.turnBoost,yawSign=nav.yawSign,directionLock=nav.directionLock,
+        courseContinuing=nav.courseContinuing,courseAge=nav.courseAge,turnInPlace=nav.turnInPlace,turnSide=nav.turnSide,targetForward=nav.targetForward,turnAngle=nav.turnAngle,turnBoost=nav.turnBoost,yawSign=nav.yawSign,directionLock=nav.directionLock,
         velocity=nav.velocity,landing=nav.landing,landingPhase=nav.landingPhase,targetVy=nav.targetVy,diagnostics=nav.directionDiagnostics},
       sensor={name=d.sensor,present=d.present,ok=d.sensorOK,error=d.sensorError,gravity=d.gravity,rawAngles=d.rawAngles,
         time=d.sensorTime,age=finite(d.sensorTime) and (now-d.sensorTime)/1000 or nil,relay=m.inputs,relayAge=m.relayAge,relayError=d.relayWarning,velocity=d.velocity},nodes=nodes}
@@ -2119,11 +2196,9 @@ local function controller()
             local hold=clamp(NAVCFG.hoverMain-LANDCFG.velocityGain*nav.verticalSpeed,NAVCFG.hoverMain,NAVCFG.maxMain)
             nav.main=nav.main+clamp(hold-nav.main,0,LANDCFG.brakeRise*navDt)
           end
-        elseif nav.mode=='YAW' and not pose.valid and (nav.stage=='YAW_TURN' or nav.stage=='CRUISE') then
-          nav.mode='COURSE';nav.yawInvalidHeld=true;navHold(nav,'YAW DEGRADED: HOLD before course fallback');rotation={enabled=true,left=0,right=0}
-        elseif navFixTime~=navFix.time or nav.velocity.source=='SENSOR' then
+        elseif navFixTime~=navFix.time or nav.velocity.source=='SENSOR' or not pose.valid or nav.courseContinuing then
           nav.gpsPaused=false
-          local dt=nav.velocity.source=='SENSOR' and navDt or navFixTime and math.min(5,(navFix.time-navFixTime)/1000) or 0
+          local dt=(nav.velocity.source=='SENSOR' or navFixTime==navFix.time) and navDt or navFixTime and math.min(5,(navFix.time-navFixTime)/1000) or 0
           navFixTime=navFix.time
           local l,r=navStep(nav,navFix,navPrevious,{recovery=recovery.active,tilt=tilt,rate=math.max(math.abs(rateR),math.abs(rateP)),yaw=pose,velocity=nav.velocity,now=os.epoch('utc')},dt)
           if nav.active then rotation={enabled=true,left=l,right=r}
