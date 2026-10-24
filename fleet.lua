@@ -1204,6 +1204,11 @@ local function navStep(nav,fix,previous,level,dt)
     if nav.probeInfo then nav.probeInfo.result='ATTITUDE PAUSED' end
     navHold(nav,'Attitude priority: stabilize before course search');return 0,0
   end
+  if pose and pose.valid then nav.yawInvalidHeld=nil
+  elseif not nav.yawInvalidHeld then
+    nav.yawInvalidHeld=true;nav.mode='COURSE'
+    navHold(nav,'YAW INVALID: HOLD before course fallback');return 0,0
+  end
   if m.courseValid and pose and pose.valid then nav.course=m.course;nav.courseTime=time;nav.courseError=m.error;nav.courseTrusted=true end
   if m.horizontal<=NAVCFG.arrivalRadius then
     nav.turnBoost=0;nav.turnAngle=0;nav.state='NAV BRAKE';nav.stage='BRAKE';nav.reason='Slow before target-Y landing approach'
@@ -2115,7 +2120,7 @@ local function controller()
             nav.main=nav.main+clamp(hold-nav.main,0,LANDCFG.brakeRise*navDt)
           end
         elseif nav.mode=='YAW' and not pose.valid and (nav.stage=='YAW_TURN' or nav.stage=='CRUISE') then
-          nav.mode='COURSE';navHold(nav,'YAW DEGRADED: HOLD before course fallback');rotation={enabled=true,left=0,right=0}
+          nav.mode='COURSE';nav.yawInvalidHeld=true;navHold(nav,'YAW DEGRADED: HOLD before course fallback');rotation={enabled=true,left=0,right=0}
         elseif navFixTime~=navFix.time or nav.velocity.source=='SENSOR' then
           nav.gpsPaused=false
           local dt=nav.velocity.source=='SENSOR' and navDt or navFixTime and math.min(5,(navFix.time-navFixTime)/1000) or 0
