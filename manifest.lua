@@ -2,9 +2,9 @@ return {
   schema=1,
   repo='robokorean/cc-ship',
   version='2026.10.24-r19',
-  ref='6810ff590c4581c819d63ac1a74cc1dd217cd084',
+  ref='d9a6650369d6e48fee38b67f5e58949675fac615',
   files={
-    ['fleet.lua']={size=146041,checksum='db2c5e06',version='2026.10.24-r19'},
+    ['fleet.lua']={size=146278,checksum='619bae18',version='2026.10.24-r19'},
     ['fleet_admin.lua']={size=47731,checksum='5906e111',version='2026.10.24-r17'},
     ['fleet_view.lua']={size=57219,checksum='db255d0b',version='2026.10.24-r19'},
     ['deploy.lua']={size=44765,checksum='5bf6ea34',version='2026.10.24-r17'},
