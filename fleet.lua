@@ -83,18 +83,18 @@ local function discoverFine(strict)
   return names
 end
 local ROLE=FLEET_ROLES or (args[1]~='test_api' and newRoles() or nil)
-local VERSION='2026.10.24-r17'
+local VERSION='2026.10.24-r18'
 local CFG={tick=0.05,finePower=1,nodeTimeout=1,commandTimeout=3,
   stopWriteTimeout=0.75,
   relayTimeout=0.5,assistDelay=3,assistRise=1,releaseRate=8,mainSlew=4,
-  deadzone=1,kp=0.7,kd=0.12,fineRise=2.75,fineFall=3.5,sensor='gimbal_sensor_1'}
+  deadzone=0.5,hoverDeadzone=0.5,movingDeadzone=1,moveEnterSpeed=1,moveExitSpeed=0.3,moveExitSeconds=2,kp=0.7,kd=0.12,fineRise=2.75,fineFall=3.5,sensor='gimbal_sensor_1'}
 local NAVCFG={courseVerified=true,yawSign=1,hoverMain=9,maxMain=10,maxVector=18,
   turnVector=18,minCourseSpeed=0.5,maxSpeed=3,arrivalRadius=10,arrivalY=5,
   arrivalSpeed=0.5,arrivalHold=3,gpsTimeout=5,uiTimeout=3,mainRate=0.25,cruiseY=350,altitudeBand=20,safetyDrop=80,stableVertical=1,
   stableTilt=5,stableRate=3,stabilizeSeconds=3,probeVector=24,probeSeconds=4,probeHoldSeconds=3,
   probeFixes=2,probeDistance=1,probeMaxSpeed=1.5,courseTimeout=5,
   alignDegrees=15,turnSeconds=3,brakeVector=6}
-local YAWCFG={bodyIds={12,13},bowSign=nil,yawOffset=0,maxAge=2,maxSkew=0.75,minBaseline=10,maxCluster=20,baselineTolerance=0.1,
+local YAWCFG={bodyIds={12,13},bowSign=nil,yawOffset=0,maxAge=2,maxSkew=0.75,minBaseline=3,maxCluster=20,baselineTolerance=0.1,
   maxRate=120,rateFilter=0.4,alignError=5,exitError=10,settleRate=2,alignSeconds=1,
   prediction=1,fineBand=15,maxVector=24,vectorRate=12,maxBoost=1,boostRise=0.5,boostFall=2,
   slipDegrees=60,slipSpeed=1,gpsLocateTimeout=2.5,gpsPollSeconds=0.5}
@@ -396,6 +396,28 @@ local function rotationValues(left,right)
   local function level(v) return math.floor(math.abs(clamp(v,-90,90))/6+0.5) end
   return {left=left>0 and level(left) or 0,right=left<0 and level(left) or 0,
     top=right>0 and level(right) or 0,bottom=right<0 and level(right) or 0}
+end
+local function attitudeMotionStep(s,velocity,actual,gpsState,rotation,armed,time)
+  local speed,source
+  if finite(velocity.forward) and finite(velocity.lateral) and finite(velocity.vertical) then
+    speed=math.max(math.sqrt(velocity.forward^2+velocity.lateral^2),math.abs(velocity.vertical));source='VELOCITY'
+  elseif gpsState=='FIX' and actual and finite(actual.sampleTime) and time-actual.sampleTime>=-100 and time-actual.sampleTime<=1500
+    and finite(actual.horizontalSpeed) and finite(actual.vy) then
+    speed=math.max(actual.horizontalSpeed,math.abs(actual.vy));source='GPS'
+  end
+  local commanded=armed and rotation.enabled and (math.abs(rotation.left or 0)>0 or math.abs(rotation.right or 0)>0)
+  local changed=false
+  if not armed then changed=s.moving==true;s.moving=false;s.quietSince=nil
+  elseif commanded or (speed and speed>=CFG.moveEnterSpeed) or not speed then
+    changed=s.moving~=true;s.moving=true;s.quietSince=nil
+  elseif s.moving and speed<=CFG.moveExitSpeed then
+    s.quietSince=s.quietSince or time
+    if time-s.quietSince>=CFG.moveExitSeconds*1000 then s.moving=false;s.quietSince=nil;changed=true end
+  else s.quietSince=nil end
+  s.speed=speed;s.source=source or 'UNKNOWN';s.commanded=commanded==true
+  s.mode=s.moving and 'MOVING' or 'HOVER';s.deadzone=s.moving and CFG.movingDeadzone or CFG.hoverDeadzone
+  CFG.deadzone=s.deadzone
+  return s.deadzone,changed
 end
 local function axisDemand(e,rate)
   if math.abs(e)<=CFG.deadzone then return 0 end
@@ -1285,7 +1307,7 @@ local function newBlackbox()
     for _,z in ipairs({'LF','RF','LB','RB'})do local v=m.zones and m.zones[z];if v then control[z]={main=v.main,sub=v.sub,fine=v.fine,fineLevels=v.fineLevels,signal=v.signal,phase=v.phase,total=v.total,target=v.target}end end
     return {state=m.state,armed=m.armed,error=m.error,coreVersion=m.version,coreAge=finite(m.time) and (now-m.time)/1000 or nil,
       fresh=fresh(m,1000),roles=m.roles,control={main=m.main,mainDemand=m.mainDemand,zones=control,vector=m.rotation,estimate=m.thrust},
-      attitude={angles=m.angles,recovery=m.recovery},nav={active=nav.active,mode=nav.commandMode,stage=nav.stage,state=nav.state,reason=nav.reason,
+      attitude={angles=m.angles,recovery=m.recovery,deadzone=m.deadzone,motion=m.attitudeMotion},nav={active=nav.active,mode=nav.commandMode,stage=nav.stage,state=nav.state,reason=nav.reason,
         gps=nav.gps,fix=nav.fix,target=nav.target,bow=nav.yaw,actual=nav.actual,course=nav.course,courseTrusted=nav.courseTrusted,courseError=nav.courseError,
         targetForward=nav.targetForward,turnAngle=nav.turnAngle,turnBoost=nav.turnBoost,yawSign=nav.yawSign,directionLock=nav.directionLock,
         velocity=nav.velocity,landing=nav.landing,landingPhase=nav.landingPhase,targetVy=nav.targetVy,diagnostics=nav.directionDiagnostics},
@@ -1390,7 +1412,7 @@ local function newBlackbox()
   end
   return b
 end
-if args[1]=='test_api' then return {logClean=logClean,newBlackbox=newBlackbox,directionDiagnostics=directionDiagnostics,rolesFactory=newRoles,discoverFine=discoverFine,modecfg=MODECFG,verticalHold=verticalHold,manualStep=manualStep,hoverStep=hoverStep,testStep=testStep,finishTest=finishTest,testRecords=function(nav)return TEST_RECORDS[nav]end,cruisecfg=CRUISECFG,directionLock=directionLock,resetCruise=resetCruise,brakingModel=brakingModel,velocityValues=velocityValues,applyVelocity=applyVelocity,speedGuard=speedGuard,cruiseCommand=cruiseCommand,velcfg=VELCFG,geometry=geometry,zones=zones,allocate=allocate,rotationValues=rotationValues,cfg=CFG,navcfg=NAVCFG,axisDemand=axisDemand,navMetrics=navMetrics,newMixer=newMixer,mixStep=mixStep,estimate=estimate,balance=balance,thrust=THRUST,recoveryState=recoveryState,recoverycfg=RECOVERY,newRecovery=newRecovery,recoveryStep=recoveryStep,recoveryDemand=recoveryDemand,navStep=navStep,ingestGPS=ingestGPS,navGPSState=navGPSState,suspendGPS=suspendGPS,navHold=navHold,yawcfg=YAWCFG,landcfg=LANDCFG,yawPose=yawPose,yawCommand=yawCommand,wrapAngle=wrapAngle,sampleGPS=sampleGPS,landingProfile=landingProfile,landingStep=landingStep,landingStage=landingStage} end
+if args[1]=='test_api' then return {attitudeMotionStep=attitudeMotionStep,logClean=logClean,newBlackbox=newBlackbox,directionDiagnostics=directionDiagnostics,rolesFactory=newRoles,discoverFine=discoverFine,modecfg=MODECFG,verticalHold=verticalHold,manualStep=manualStep,hoverStep=hoverStep,testStep=testStep,finishTest=finishTest,testRecords=function(nav)return TEST_RECORDS[nav]end,cruisecfg=CRUISECFG,directionLock=directionLock,resetCruise=resetCruise,brakingModel=brakingModel,velocityValues=velocityValues,applyVelocity=applyVelocity,speedGuard=speedGuard,cruiseCommand=cruiseCommand,velcfg=VELCFG,geometry=geometry,zones=zones,allocate=allocate,rotationValues=rotationValues,cfg=CFG,navcfg=NAVCFG,axisDemand=axisDemand,navMetrics=navMetrics,newMixer=newMixer,mixStep=mixStep,estimate=estimate,balance=balance,thrust=THRUST,recoveryState=recoveryState,recoverycfg=RECOVERY,newRecovery=newRecovery,recoveryStep=recoveryStep,recoveryDemand=recoveryDemand,navStep=navStep,ingestGPS=ingestGPS,navGPSState=navGPSState,suspendGPS=suspendGPS,navHold=navHold,yawcfg=YAWCFG,landcfg=LANDCFG,yawPose=yawPose,yawCommand=yawCommand,wrapAngle=wrapAngle,sampleGPS=sampleGPS,landingProfile=landingProfile,landingStep=landingStep,landingStage=landingStage} end
 local function managedStop()
   while true do
     local _,id=os.pullEvent('fleet_managed_stop')
@@ -1631,6 +1653,7 @@ local function controller()
   local rotation={enabled=false,left=0,right=0}
   local mixer=newMixer({LF=0,RF=0,LB=0,RB=0})
   local recovery=newRecovery()
+  local attitudeMotion={moving=false,mode='HOVER',deadzone=CFG.hoverDeadzone}
   local thrustState={total=0}
   local zoneState={}
   local interval=0
@@ -1944,6 +1967,8 @@ local function controller()
         state=armed and (recovery.active and 'RECOVERY' or 'LEVEL') or (connected and good and 'READY / OFF' or 'CHECKING')
       end
       sequence=sequence+1
+      local _,motionChanged=attitudeMotionStep(attitudeMotion,velocityValues(velocityPacket,os.epoch('utc')),nav.actual,nav.gps,rotation,armed,os.epoch('utc'))
+      if motionChanged then emitLog('ATTITUDE','DEADZONE_MODE',{mode=attitudeMotion.mode,deadzone=attitudeMotion.deadzone,speed=attitudeMotion.speed,source=attitudeMotion.source})end
       local cr,cp=axisDemand(roll,rateR),axisDemand(pitch,rateP)
       if armed and not faultText then
         recoveryStep(recovery,roll,pitch,rateR,rateP,tilt,math.min(dt,0.2),now)
@@ -1974,7 +1999,7 @@ local function controller()
         {token=FLEET_MAINTENANCE.token,zero=maintenanceSince~=nil,readySince=maintenanceSince,frames=maintenanceFrames,missingSince=maintenanceMissing} or nil)
       send(11,{kind='STATUS',session=session,armed=armed,state=state,error=faultText,
         inputs=inputs,relayAge=os.clock()-relaySeen,interval=interval,main=baseMain,zones=zoneState,
-        seq=sequence,version=VERSION,roles=ROLE.snapshot(),recovery={active=recovery.active,reason=recovery.reason,stable=recovery.stable,rateR=rateR,rateP=rateP},thrust=thrustState,mainCommand=math.floor(baseDemand()+1e-8),mainDemand=baseDemand(),nav=nav,deadzone=CFG.deadzone,rotation={enabled=rotation.enabled,left=rotation.enabled and (rotation.appliedLeft or rotation.left) or 0,
+        seq=sequence,version=VERSION,roles=ROLE.snapshot(),recovery={active=recovery.active,reason=recovery.reason,stable=recovery.stable,rateR=rateR,rateP=rateP},thrust=thrustState,mainCommand=math.floor(baseDemand()+1e-8),mainDemand=baseDemand(),nav=nav,deadzone=CFG.deadzone,attitudeMotion=attitudeMotion,rotation={enabled=rotation.enabled,left=rotation.enabled and (rotation.appliedLeft or rotation.left) or 0,
           right=rotation.enabled and (rotation.appliedRight or rotation.right) or 0,outputs=rotationValues(rotation.enabled and (rotation.appliedLeft or rotation.left) or 0,rotation.enabled and (rotation.appliedRight or rotation.right) or 0)},angles=sensorTime and {roll=roll,pitch=pitch,time=sensorTime},
         diagnostic={sensor=CFG.sensor,sensorOK=sensorOK,sensorError=sensorError,present=sensorPresent,
           angleOK=angleOK,angleError=angleError,gravity=rawGravity,rawAngles=rawAngles,angleTime=angleTime,
@@ -2149,7 +2174,7 @@ local function ui()
     local v=status.inputs or {left=0,right=0,front=0,back=0}
     local out={status.state,string.format('Relay L:%d R:%d F:%d B:%d',v.left,v.right,v.front,v.back),
       string.format('Loop: %.0f ms  Input age: %.0f ms',status.interval*1000,status.relayAge*1000),
-      'Sensor control / tolerance +/-1 deg','Main base: '..main}
+      string.format('Sensor control / tolerance +/-%.1f deg',status.deadzone or 1),'Main base: '..main}
     for _,z in ipairs({'LF','RF','LB','RB'}) do
       local v=status.zones[z]
       if v then out[#out+1]=string.format('%s demand %.1f fine %.1f sub %d main %d',z,v.signal,v.fine,v.sub,v.main) end
@@ -2238,7 +2263,7 @@ local function ui()
     local d=status.diagnostic or {}
     local a=status.angles or {}
     local out={'CONTROL: '..tostring(d.sensor or 'unknown')..' / gravity',
-      finite(a.roll) and finite(a.pitch) and string.format('Control R %.2f P %.2f / tolerance 1 deg',a.roll,a.pitch) or 'Control R/P: NO DATA'}
+      finite(a.roll) and finite(a.pitch) and string.format('Control R %.2f P %.2f / tolerance %.1f deg',a.roll,a.pitch,status.deadzone or 1) or 'Control R/P: NO DATA'}
     out[#out+1]='Sensor '..(d.present and 'PRESENT' or 'MISSING')..' / '..(d.sensorOK and 'READ OK' or 'READ FAILED')
     if d.sensorError then out[#out+1]=tostring(d.sensorError):sub(1,160) end
     if d.sensorTime then out[#out+1]=string.format('Last gravity age: %.2fs',(os.epoch('utc')-d.sensorTime)/1000) end
@@ -2250,8 +2275,9 @@ local function ui()
     else add('Raw angles: NO DATA') end
     if d.angleOK==false then add('Raw angle read: FAILED') end
     local r,p=a.roll or 0,a.pitch or 0
-    if d.sensorOK and fresh(a,500) then add('Lift: '..(r>CFG.deadzone and 'RIGHT' or r< -CFG.deadzone and 'LEFT' or 'L/R OK')..' / '..
-      (p>CFG.deadzone and 'FRONT' or p< -CFG.deadzone and 'BACK' or 'F/B OK')) else add('Lift: UNKNOWN / STALE') end
+    local deadzone=status.deadzone or 1
+    if d.sensorOK and fresh(a,500) then add('Lift: '..(r>deadzone and 'RIGHT' or r< -deadzone and 'LEFT' or 'L/R OK')..' / '..
+      (p>deadzone and 'FRONT' or p< -deadzone and 'BACK' or 'F/B OK')) else add('Lift: UNKNOWN / STALE') end
     add('Relay comparison only: lamp = LOW side')
     for _,key in ipairs({'front','back','left','right'}) do
       local valid=(d.relayAge or math.huge)<=0.5 and not d.relayWarning
