@@ -81,7 +81,7 @@ local function discoverFine(strict)
   return names
 end
 local ROLE=FLEET_ROLES or (args[1]~='test_api' and newRoles() or nil)
-local ADMIN_VERSION='2026.10.20-r16'
+local ADMIN_VERSION='2026.10.24-r17'
 local REQUEST=42615
 local RESPONSE=42616
 local MAGIC='fleet_admin_v1'
@@ -331,6 +331,17 @@ end
 if args[1]=='test_api' then return {spaceRequired=spaceRequired,preflightSpace=preflightSpace,checksum=checksum,validName=validName,replaceFile=replaceFile,recover=recover,loadUpdate=loadUpdate,restoreUpdate=restoreUpdate,loadBootstrap=loadBootstrap,restoreBootstrap=restoreBootstrap,recoverUpdate=recoverUpdate} end
 local id=ROLE.slot
 assert(isTarget(id),'fleet_admin runs on 10-14 / 16-19')
+local adminLogs={}
+local adminLogSeq=0
+local adminLogRun=uid()
+local function adminLog(category,code,data)
+  adminLogSeq=adminLogSeq+1
+  adminLogs[#adminLogs+1]={magic='fleet_log_v1',key=settings.get('fleet.admin_key',''),source=id,actualId=ROLE.actual,role=ROLE.role,
+    id='service:'..adminLogRun..':'..adminLogSeq,time=now(),version=ADMIN_VERSION,category=category,code=code,data=data or {}}
+  os.queueEvent('fleet_blackbox_admin',ROLE.actual,adminLogs[#adminLogs])
+  if #adminLogs>32 then table.remove(adminLogs,1)end
+end
+adminLog('SYSTEM','MANAGER_BOOT',{version=ADMIN_VERSION,nodeVersion=FLEET_NODE_VERSION})
 local native=term.current()
 local flight={state='STOPPED',error=nil,runtime=nil,co=nil,filter=nil,terminal=native,runVersion=nil}
 local zeroTask
@@ -435,6 +446,10 @@ local function service()
   local quota,quotaTime=0,os.clock()
   local function respond(m,state,detail,extra)
     local body={state=state,detail=detail,info=extra}
+    if state=='FAILED' or (m.op=='START' or m.op=='STOP' or m.op=='RESTART' or m.op=='REBOOT' or m.op:match('^UPDATE_')) and state~='RECEIVED' then
+      adminLog(state=='FAILED' and 'SAFETY' or 'ADMIN',m.op,{request=m.rid,state=state,detail=tostring(detail or ''):sub(1,500),error=state=='FAILED' and tostring(detail) or nil,
+        running=extra and extra.runningCode,files=extra and extra.files})
+    end
     cache[m.rid]=body;cacheOrder[#cacheOrder+1]=m.rid
     while #cacheOrder>160 do local old=table.remove(cacheOrder,1);if old~=m.rid then cache[old]=nil end end
     net.send(net.envelope(15,m.rid,'RESULT',body),RESPONSE)
@@ -725,7 +740,23 @@ local function service()
       sleep(0.1)
     end
   end
-  parallel.waitForAll(incoming,worker,maintenance,ROLE.run)
+  local function logWorker()
+    while true do
+      for _=1,4 do
+        local record=table.remove(adminLogs,1);if not record then break end
+        pcall(function()for _,side in ipairs(redstone.getSides())do if peripheral.hasType(side,'modem')then
+          pcall(peripheral.call,side,'transmit',42618,42618,record)
+        end end end)
+        if record.category=='SAFETY' then pcall(function()
+          local text=textutils.serialize({time=record.time,role=ROLE.role,actualId=ROLE.actual,version=ADMIN_VERSION,code=record.code,error=record.data.error or record.data.detail})
+          text=text:sub(1,4096)
+          local free=fs.getFreeSpace('');if free=='unlimited' or type(free)=='number' and free>=#text+32768 then writeFile('fleet_node_error.log',text)end
+        end)end
+      end
+      sleep(.2)
+    end
+  end
+  parallel.waitForAll(incoming,worker,maintenance,ROLE.run,logWorker)
 end
 local function resumeTask(task,event)
   local previous=term.current();term.redirect(task.terminal or native)
@@ -745,6 +776,7 @@ startAdmin()
 local startupTx=loadUpdate()
 if recovered and not fs.exists('fleet_hold.lua') and not (startupTx and startupTx.state~='CONFIRMED') and settings.get('fleet.autostart',true) then launch() end
 local tick=os.startTimer(0.1)
+local lastIssue
 while true do
   if flight.co and not flight.started then
     flight.started=true
@@ -789,6 +821,11 @@ while true do
       flight.adminError=tostring(err);adminTask=nil
       flight.adminError=tostring(err)..' / lifecycle resumes after service restart'
     end
+  end
+  local issue=flight.error or flight.runtime and flight.runtime.error or flight.adminError
+  if issue~=lastIssue then
+    lastIssue=issue
+    adminLog(issue and 'SAFETY' or 'SYSTEM',issue and 'RUNTIME_FAULT' or 'RUNTIME_RECOVERED',{state=flight.state,error=issue and tostring(issue):sub(1,500) or nil})
   end
   if event[1]=='timer' and event[2]==tick then
     if not adminTask then startAdmin() end

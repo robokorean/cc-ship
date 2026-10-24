@@ -83,7 +83,7 @@ local function discoverFine(strict)
   return names
 end
 local ROLE=FLEET_ROLES or (args[1]~='test_api' and newRoles() or nil)
-local VERSION='2026.10.19-r14'
+local VERSION='2026.10.24-r17'
 local CFG={tick=0.05,finePower=1,nodeTimeout=1,commandTimeout=3,
   stopWriteTimeout=0.75,
   relayTimeout=0.5,assistDelay=3,assistRise=1,releaseRate=8,mainSlew=4,
@@ -94,14 +94,14 @@ local NAVCFG={courseVerified=true,yawSign=1,hoverMain=9,maxMain=10,maxVector=18,
   stableTilt=5,stableRate=3,stabilizeSeconds=3,probeVector=24,probeSeconds=4,probeHoldSeconds=3,
   probeFixes=2,probeDistance=1,probeMaxSpeed=1.5,courseTimeout=5,
   alignDegrees=15,turnSeconds=3,brakeVector=6}
-local YAWCFG={bodyIds={10,11},yawOffset=nil,maxAge=2,maxSkew=0.75,minBaseline=10,maxCluster=20,baselineTolerance=0.1,
+local YAWCFG={bodyIds={12,13},bowSign=nil,yawOffset=0,maxAge=2,maxSkew=0.75,minBaseline=10,maxCluster=20,baselineTolerance=0.1,
   maxRate=120,rateFilter=0.4,alignError=5,exitError=10,settleRate=2,alignSeconds=1,
   prediction=1,fineBand=15,maxVector=24,vectorRate=12,maxBoost=1,boostRise=0.5,boostFall=2,
   slipDegrees=60,slipSpeed=1,gpsLocateTimeout=2.5,gpsPollSeconds=0.5}
 local LANDCFG={far=50,middle=20,near=5,fast=2,medium=1,slow=0.5,creep=0.2,
   tolerance=0.75,holdSpeed=0.25,positionGain=0.2,velocityGain=0.8,maxAscent=1,
   prediction=3,excessSpeed=0.5,brakeRise=2,resumeSeconds=3,exitRadius=1.5,yOffset=0}
--- ID 10: fleet.yaw_ids, fleet.yaw_offset = known bow - RAW (0=X+, 90=Z+), fleet.cruise_speed.
+-- CORE: fleet.bow_sign=+1/-1; optional fleet.bow_offset. 0=X+, 90=Z+.
 -- ID 11: fleet.velocity_lateral_sign / forward_sign / vertical_sign = +1 or -1.
 local VELCFG={maxAge=0.5,pollSeconds=0.1,lateralSign=1,forwardSign=1,verticalSign=1,
   forwardLimit=50,reverseLimit=30,limitMargin=2,cruiseSpeed=3,acceleration=0.5,
@@ -116,15 +116,9 @@ local function setting(name,default)
   if settings and settings.get then local ok,v=pcall(settings.get,name,default);if ok then return v end end
   return default
 end
-YAWCFG.yawOffset=tonumber(setting('fleet.yaw_offset',nil))
-do
-  local ids=setting('fleet.yaw_roles',setting('fleet.yaw_ids','10,11'));local list,seen={},{}
-  if type(ids)=='string' then for word in ids:gmatch('[^, ]+') do
-    local id=tonumber(word) or ROLE and ROLE.slots[word:upper()]
-    if id and id%1==0 and id>=10 and id<=14 and not seen[id] then list[#list+1]=id;seen[id]=true else list={};break end
-  end end
-  YAWCFG.bodyIds=list
-end
+YAWCFG.bowSign=tonumber(setting('fleet.bow_sign',nil))
+YAWCFG.yawOffset=tonumber(setting('fleet.bow_offset',0))
+YAWCFG.legacyOffset=setting('fleet.yaw_offset',nil)
 for _,role in ipairs({'lateral','forward','vertical'}) do
   local v=tonumber(setting('fleet.velocity_'..role..'_sign',1))
   VELCFG[role..'Sign']=(v==1 or v==-1) and v or 1
@@ -467,9 +461,9 @@ local function navMetrics(target,fix,previous)
     local vx,vy,vz=(fix.x-previous.x)/dt,(fix.y-previous.y)/dt,(fix.z-previous.z)/dt
     out.speed=math.sqrt(vx*vx+vy*vy+vz*vz);out.horizontalSpeed=math.sqrt(vx*vx+vz*vz)
     out.vx=vx;out.vy=vy;out.vz=vz;out.sampleTime=fix.time
-    if out.horizontalSpeed>=NAVCFG.minCourseSpeed and h>0 then
+    if out.horizontalSpeed>=NAVCFG.minCourseSpeed then
       local atan2=math.atan2 or function(y,x) return math.atan(y,x) end
-      out.error=math.deg(atan2(vx*dz-vz*dx,vx*dx+vz*dz))
+      if h>0 then out.error=math.deg(atan2(vx*dz-vz*dx,vx*dx+vz*dz))end
       out.course=math.deg(atan2(vz,vx));out.courseValid=true
     end
   end
@@ -512,73 +506,99 @@ local function sampleGPS(last,id,ok,x,y,z,time)
   last.failures=(last.failures or 0)+1;last.error=not ok and tostring(x) or 'NO FIX'
   return last
 end
-local function yawPose(nodes,target,time,track)
+local function yawPose(nodes,target,time,track,position)
   track=track or {}
-  local ids={};for _,id in ipairs(YAWCFG.bodyIds) do ids[#ids+1]=id end;ids[#ids+1]=15
-  local q={valid=false,fixes=0,required=#ids,reason='BODY YAW GPS DEGRADED',time=time,offset=YAWCFG.yawOffset,bodyIds=YAWCFG.bodyIds}
-  local function invalid(reason) q.reason=reason;track.pose=nil;track.times=nil;return q end
+  local ids={12,13}
+  local q={valid=false,fixes=0,required=2,source='GPS_LR_12_13',reason='BOW GPS DEGRADED',time=time,
+    offset=YAWCFG.yawOffset,bowSign=YAWCFG.bowSign,bodyIds=ids,samples={}}
+  local function invalid(code,reason)q.reasonCode=code;q.reason=reason;track.pose=nil;track.times=nil;return q end
   local function finish()
     q.valid=true;q.age=(time-q.time)/1000
-    if validPosition(target) then
-      local dx,dz=target.x-q.center.x,target.z-q.center.z
-      if dx*dx+dz*dz>0.0001 then q.targetYaw=wrapAngle(atanDeg(dz,dx));q.error=wrapAngle(q.targetYaw-q.yaw) end
+    q.targetOrigin=validPosition(position) and position or q.center;q.targetSource=validPosition(position) and 'NAV GPS' or '12/13 MIDPOINT'
+    if validPosition(target)then
+      local dx,dz=target.x-q.targetOrigin.x,target.z-q.targetOrigin.z
+      if dx*dx+dz*dz>0.0001 then q.targetYaw=wrapAngle(atanDeg(dz,dx));q.error=wrapAngle(q.targetYaw-q.yaw)end
     end
     return q
   end
-  if #ids<2 then return invalid('Configure fleet.yaw_ids: body IDs 10..14') end
-  local p={};local oldest,newest=math.huge,-math.huge
-  for _,id in ipairs(ids) do
+  local points={};local oldest,newest=math.huge,-math.huge
+  for _,id in ipairs(ids)do
     local n=nodes[id];local g=n and n.gps
-    if n and n.ok and finite(n.time) and time-n.time>=-100 and time-n.time<=CFG.nodeTimeout*1000
-      and type(g)=='table' and g.id==id and g.ok==true and not g.degraded and validPosition(g)
-      and finite(g.time) and time-g.time>=-100 and time-g.time<=YAWCFG.maxAge*1000 then
-      p[id]=g;q.fixes=q.fixes+1;oldest=math.min(oldest,g.time);newest=math.max(newest,g.time)
+    local state='NO DATA'
+    if type(g)=='table' then
+      if g.error=='NO LOCAL WIRELESS GPS'then state='NO LOCAL WIRELESS GPS'
+      elseif not n.ok then state='NODE FAULT'
+      elseif not finite(n.time) or time-n.time>CFG.nodeTimeout*1000 or time-n.time< -100 then state='NODE STALE'
+      elseif g.ok~=true then state='NO FIX'
+      elseif not finite(g.time) or time-g.time>YAWCFG.maxAge*1000 or time-g.time< -100 then state='STALE'
+      elseif g.degraded or g.ok~=true then state=g.ok and 'DEGRADED' or 'NO FIX'
+      elseif g.id~=id or not validPosition(g)then state='INVALID FIX'
+      else state='FIX';points[id]=g;q.fixes=q.fixes+1;oldest=math.min(oldest,g.time);newest=math.max(newest,g.time)end
     end
+    q.samples[id]={state=state,x=g and g.x,y=g and g.y,z=g and g.z,time=g and g.time,sampleTime=g and g.sampleTime,error=g and g.error}
   end
-  if q.fixes~=#ids then return invalid('BODY GPS needs configured cluster + 15; check local wireless') end
-  q.skew=(newest-oldest)/1000;q.oldest=oldest
-  if q.skew>YAWCFG.maxSkew then
-    if track.pose and time-track.pose.oldest<=YAWCFG.maxAge*1000 then
-      local retained=track.pose
-      for k,v in pairs(retained) do q[k]=v end
-      q.pending=true;q.reason='Waiting for synchronized BODY frame';return finish()
-    end
-    return invalid('BODY GPS sample skew')
-  end
-  local cluster={x=0,y=0,z=0}
-  for _,id in ipairs(YAWCFG.bodyIds) do for _,axis in ipairs({'x','y','z'}) do cluster[axis]=cluster[axis]+p[id][axis]/#YAWCFG.bodyIds end end
-  local center=p[15];q.front=cluster;q.rear={x=center.x,y=center.y,z=center.z};q.center=q.rear
-  local bx,bz=cluster.x-center.x,cluster.z-center.z
-  q.baseline=math.sqrt(bx*bx+bz*bz);q.rawYaw=wrapAngle(atanDeg(bz,bx))
-  for _,id in ipairs(YAWCFG.bodyIds) do
-    if math.sqrt((p[id].x-cluster.x)^2+(p[id].z-cluster.z)^2)>YAWCFG.maxCluster then return invalid('BODY cluster geometry changed') end
-  end
-  if q.baseline<YAWCFG.minBaseline then return invalid('BODY horizontal baseline too short') end
-  if track.baseline and math.abs(q.baseline-track.baseline)>math.max(2,track.baseline*YAWCFG.baselineTolerance) then return invalid('BODY baseline length changed; verify fixed mounts') end
-  if not finite(YAWCFG.yawOffset) then return invalid('CALIBRATE fleet.yaw_offset = known bow - RAW YAW') end
+  if q.fixes~=2 then return invalid('YAW_GPS_DEGRADED','12 '..q.samples[12].state..' / 13 '..q.samples[13].state)end
+  q.oldest=oldest;q.skew=(newest-oldest)/1000
+  if q.skew>YAWCFG.maxSkew then return invalid('YAW_GPS_DEGRADED','12/13 GPS sample skew')end
+  local left,right=points[12],points[13];q.left=left;q.right=right
+  q.center={x=(left.x+right.x)/2,y=(left.y+right.y)/2,z=(left.z+right.z)/2}
+  local dx,dz=right.x-left.x,right.z-left.z;q.lr={x=dx,z=dz}
+  q.baseline=math.sqrt(dx*dx+dz*dz);q.rawYaw=wrapAngle(atanDeg(-dx,dz))
+  if q.baseline<YAWCFG.minBaseline then return invalid('YAW_BASELINE_INVALID','12/13 horizontal baseline too short')end
+  if track.baseline and math.abs(q.baseline-track.baseline)>math.max(2,track.baseline*YAWCFG.baselineTolerance)then return invalid('YAW_BASELINE_INVALID','12/13 baseline length changed; verify mounts')end
+  track.baseline=track.baseline or q.baseline
+  if YAWCFG.bowSign~=1 and YAWCFG.bowSign~=-1 then return invalid('BOW_UNVERIFIED','Confirm fleet.bow_sign=1 or -1 on CORE; RAW is sign +1')end
+  if not finite(YAWCFG.yawOffset)then return invalid('BOW_UNVERIFIED','Invalid fleet.bow_offset')end
   local allNew=not track.times
-  if track.times then allNew=true;for id,g in pairs(p) do if not track.times[id] or g.time<=track.times[id] then allNew=false end end end
+  if track.times then allNew=true;for id,g in pairs(points)do if not track.times[id] or g.time<=track.times[id]then allNew=false end end end
   local pose=track.pose
   if not allNew then
-    if not pose or time-pose.oldest>YAWCFG.maxAge*1000 then return invalid('BODY YAW waiting for complete new frame') end
-    for k,v in pairs(pose) do q[k]=v end;q.pending=true;return finish()
+    if not pose or time-pose.oldest>YAWCFG.maxAge*1000 then return invalid('YAW_GPS_DEGRADED','Waiting for complete new 12/13 frame')end
+    for k,v in pairs(pose)do q[k]=v end;q.pending=true;return finish()
   end
-  q.yaw=wrapAngle(q.rawYaw+YAWCFG.yawOffset);q.time=0
-  for _,g in pairs(p) do q.time=q.time+g.time/#ids end
-  q.rate=0;q.rateValid=false
+  q.yaw=wrapAngle(q.rawYaw+(YAWCFG.bowSign==-1 and 180 or 0)+YAWCFG.yawOffset)
+  q.time=(left.time+right.time)/2;q.rate=0;q.rateValid=false
   if pose then
     local dt=(q.time-pose.time)/1000
     if dt>0.05 and dt<=YAWCFG.maxAge then
       local rate=wrapAngle(q.yaw-pose.yaw)/dt
-      if math.abs(rate)>YAWCFG.maxRate then return invalid('BODY YAW sample jump / angular rate invalid') end
+      if math.abs(rate)>YAWCFG.maxRate then return invalid('YAW_GPS_DEGRADED','BOW GPS sample jump / rate invalid')end
       q.rate=pose.rateValid and pose.rate+(rate-pose.rate)*dt/(YAWCFG.rateFilter+dt) or rate;q.rateValid=true
     end
   end
-  track.times={};for id,g in pairs(p) do track.times[id]=g.time end
-  track.baseline=track.baseline or q.baseline
-  q.reason='15 -> BODY cluster baseline + calibrated offset'
-  track.pose={};for k,v in pairs(q) do track.pose[k]=v end
+  track.times={[12]=left.time,[13]=right.time};q.reason='BOW from 12 LEFT -> 13 RIGHT; sign/offset confirmed'
+  track.pose={};for k,v in pairs(q)do track.pose[k]=v end
   return finish()
+end
+local function directionDiagnostics(nav,rotation,time,track)
+  track=track or {};local y=nav.yaw or {};local m=nav.actual or {};local warnings={}
+  local course=nav.gps=='FIX' and m.courseValid and finite(m.course) and finite(m.sampleTime) and time-m.sampleTime<=2000 and (m.horizontalSpeed or 0)>=1
+  local gap=course and y.valid and wrapAngle(m.course-y.yaw) or nil
+  local opposite=finite(gap) and math.abs(gap)>=150
+  local mean=rotation.enabled and ((rotation.appliedLeft or rotation.left or 0)+(rotation.appliedRight or rotation.right or 0))/2 or 0
+  local reverse=opposite and mean>=3
+  if opposite then warnings[#warnings+1]='BOW_COURSE_OPPOSITE'end
+  if reverse then warnings[#warnings+1]='FORWARD_COMMAND_REVERSE_MOTION'end
+  if m.sampleTime and m.sampleTime~=track.motionTime then
+    track.motionTime=m.sampleTime
+    if reverse then track.reverseSince=track.reverseSince or time;track.reverseFixes=(track.reverseFixes or 0)+1
+    else track.reverseSince=nil;track.reverseFixes=0 end
+  end
+  if not reverse then track.reverseSince=nil;track.reverseFixes=0 end
+  if reverse and track.reverseSince and time-track.reverseSince>=3000 and track.reverseFixes>=3 then warnings[#warnings+1]='VECTOR_DIRECTION_SUSPECT'end
+  local turn=rotation.enabled and math.abs((rotation.left or 0)-(rotation.right or 0))>=6 and y.valid and finite(y.error)
+  if turn and y.time~=track.yawTime then
+    track.yawTime=y.time;local e=math.abs(y.error)
+    if not track.turnSince or e<(track.lastError or e)-0.5 then track.turnSince=time;track.startError=e end
+    track.lastError=e
+    track.growing=time-track.turnSince>=2000 and e-(track.startError or e)>=5
+  elseif not turn then track.turnSince=nil;track.startError=nil;track.lastError=nil;track.growing=false end
+  if track.growing then warnings[#warnings+1]='YAW_ERROR_GROWING'end
+  if y.reasonCode=='YAW_BASELINE_INVALID'then warnings[#warnings+1]='YAW_BASELINE_INVALID'
+  elseif y.reasonCode=='YAW_GPS_DEGRADED'then warnings[#warnings+1]='YAW_GPS_DEGRADED'
+  elseif y.reasonCode=='BOW_UNVERIFIED'then warnings[#warnings+1]='BOW_UNVERIFIED'end
+  return {warnings=warnings,bowCourseError=gap,course=course and m.course or nil,bow=y.valid and y.yaw or nil,
+    target=y.targetYaw,forwardVector=mean,reverseFixes=track.reverseFixes or 0,reason=y.reason,time=time}
 end
 local function velocityValues(packet,time)
   local out={source='GPS',time=time}
@@ -1168,7 +1188,209 @@ local function navStep(nav,fix,previous,level,dt)
   return cruiseCommand(nav,m,dt)
 end
 
-if args[1]=='test_api' then return {rolesFactory=newRoles,discoverFine=discoverFine,modecfg=MODECFG,verticalHold=verticalHold,manualStep=manualStep,hoverStep=hoverStep,testStep=testStep,finishTest=finishTest,testRecords=function(nav)return TEST_RECORDS[nav]end,cruisecfg=CRUISECFG,directionLock=directionLock,resetCruise=resetCruise,brakingModel=brakingModel,velocityValues=velocityValues,applyVelocity=applyVelocity,speedGuard=speedGuard,cruiseCommand=cruiseCommand,velcfg=VELCFG,geometry=geometry,zones=zones,allocate=allocate,rotationValues=rotationValues,cfg=CFG,navcfg=NAVCFG,axisDemand=axisDemand,navMetrics=navMetrics,newMixer=newMixer,mixStep=mixStep,estimate=estimate,balance=balance,thrust=THRUST,recoveryState=recoveryState,recoverycfg=RECOVERY,newRecovery=newRecovery,recoveryStep=recoveryStep,recoveryDemand=recoveryDemand,navStep=navStep,ingestGPS=ingestGPS,navGPSState=navGPSState,suspendGPS=suspendGPS,navHold=navHold,yawcfg=YAWCFG,landcfg=LANDCFG,yawPose=yawPose,yawCommand=yawCommand,wrapAngle=wrapAngle,sampleGPS=sampleGPS,landingProfile=landingProfile,landingStep=landingStep,landingStage=landingStage} end
+local LOG_CHANNEL=42618
+local LOG_MAGIC='fleet_log_v1'
+local LOG_QUEUE,LOG_RECENT={},{}
+local LOG_RUN=tostring(os.epoch and os.epoch('utc') or 0)..':'..math.random(1,1000000000)
+local LOG_SEQ=0
+local function emitLog(category,code,data)
+  local stamp=os.epoch('utc');data=data or {}
+  local signature=category..':'..code..':'..tostring(data.reason or data.error or data.state or data.action or '')
+  if data.seq~=nil then signature=signature..':'..tostring(data.client)..':'..tostring(data.seq)end
+  if LOG_RECENT[signature] and stamp-LOG_RECENT[signature]<1000 then return end
+  LOG_RECENT[signature]=stamp
+  for k,t in pairs(LOG_RECENT)do if stamp-t>5000 then LOG_RECENT[k]=nil end end
+  LOG_SEQ=LOG_SEQ+1
+  LOG_QUEUE[#LOG_QUEUE+1]={magic=LOG_MAGIC,key=setting('fleet.admin_key',''),id=LOG_RUN..':'..LOG_SEQ,
+    source=ROLE and ROLE.slot or 0,actualId=ROLE and ROLE.actual or 0,role=ROLE and ROLE.role or '?',time=stamp,version=VERSION,category=category,code=code,data=data}
+  if #LOG_QUEUE>64 then table.remove(LOG_QUEUE,1)end
+end
+local function logSender()
+  while true do
+    for _=1,4 do
+      local m=table.remove(LOG_QUEUE,1);if not m then break end
+      pcall(function()for _,side in ipairs(redstone.getSides())do if peripheral.hasType(side,'modem')then
+        pcall(peripheral.call,side,'transmit',LOG_CHANNEL,LOG_CHANNEL,m)
+      end end end)
+    end
+    sleep(0.1)
+  end
+end
+local function logClean(value,seen,depth)
+  local kind=type(value)
+  if kind=='number'then return finite(value) and value or ('NONFINITE:'..tostring(value))end
+  if kind~='table'then if kind=='string' or kind=='boolean' or kind=='nil'then return value end;return tostring(value)end
+  seen=seen or {};depth=depth or 0
+  if seen[value] or depth>12 then return '[CYCLE/DEPTH LIMIT]'end
+  seen[value]=true;local count,max,array=0,0,true
+  for k in pairs(value)do count=count+1;if type(k)~='number' or k%1~=0 or k<1 then array=false else max=math.max(max,k)end end
+  array=array and count==max
+  local out={}
+  for k,v in pairs(value)do out[array and k or tostring(k)]=logClean(v,seen,depth+1)end
+  seen[value]=nil;return out
+end
+local function newBlackbox()
+  local function option(name,default,lo,hi)local n=tonumber(setting('fleet.blackbox_'..name,default));return finite(n) and clamp(n,lo,hi) or default end
+  local c={interval=option('interval',1,0.5,1),maxBytes=option('bytes',32768,8192,131072),eventBytes=option('event_bytes',65536,8192,131072),
+    reserve=option('reserve',24576,8192,262144),historySeconds=option('history_seconds',60,20,120),enabled=setting('fleet.blackbox',true)~=false}
+  local b={config=c,queue={},history={},signatures={},seen={},written=0,dropped=0,error=nil,lastWrite=nil,lastSnapshot=-math.huge,lastStatus=nil,retry=0}
+  local function encode(r)
+    r=logClean(r)
+    local ok,s=pcall(function()if textutils.serializeJSON then return textutils.serializeJSON(r)end;return textutils.serialize(r):gsub('\n',' ')end)
+    if not ok then b.error=tostring(s);return nil end
+    if #s>math.min(c.maxBytes,c.eventBytes,16384)-1 then
+      b.dropped=b.dropped+1
+      r={schema=1,time=r.time,source=r.source,actualId=r.actualId,role=r.role,category=r.category,code=r.code,data={truncated=true,originalBytes=#s}}
+      local good,v=pcall(textutils.serialize,r);if not good then b.error=tostring(v);return nil end;s=v:gsub('\n',' ')
+    end
+    return s..'\n'
+  end
+  local function record(category,code,data,source)
+    source=source or {}
+    return {schema=1,time=source.time or os.epoch('utc'),receivedTime=os.epoch('utc'),source=source.source or 11,
+      actualId=source.actualId or ROLE and ROLE.actual or 11,role=source.role or 'SENSOR_UI',run=LOG_RUN,
+      session=b.lastStatus and b.lastStatus.session,version=source.version or VERSION,category=category,code=code,data=data}
+  end
+  local function enqueue(text,event,critical)
+    if not c.enabled or not text then return end
+    if #b.queue>=96 then
+      local victim
+      for i,v in ipairs(b.queue)do if not v.critical then victim=i;break end end
+      table.remove(b.queue,victim or 1);b.dropped=b.dropped+1
+    end
+    b.queue[#b.queue+1]={text=text,event=event,critical=critical}
+  end
+  function b.event(category,code,data,critical,source)
+    if not c.enabled then return end
+    if data and data.ok~=false and (data.action=='STOP' or data.action=='MOTION_STOP' or data.action=='ADMIN_STOP' or data.action=='TEST_ABORT')then critical=true end
+    local s=encode(record(category,code,data,source));if not s then return end
+    b.lastEvent={time=os.epoch('utc'),category=category,code=code}
+    if critical then
+      local lines={};local size=#s;local now=os.epoch('utc')
+      for i=#b.history,1,-1 do local h=b.history[i]
+        if now-h.time<=30000 and size+#h.text<=c.eventBytes then table.insert(lines,1,h.text);size=size+#h.text end
+      end
+      lines[#lines+1]=s;enqueue(table.concat(lines),true,true)
+    else enqueue(s,true,false)end
+  end
+  local function transition(key,value,category,code,data,critical)
+    if b.signatures[key]~=value then b.signatures[key]=value;b.event(category,code,data,critical)end
+  end
+  local function summary(m,now)
+    local nav=m.nav or {};local d=m.diagnostic or {};local nodes={};local control={}
+    for _,id in ipairs({12,13,14,16,17,18,19})do local n=d.nodes and d.nodes[id]
+      if n then nodes[tostring(id)]={actualId=n.actualId,role=n.role,version=n.version,ok=n.ok,state=n.state,error=n.error,
+        age=finite(n.time) and (now-n.time)/1000 or nil,fineCount=n.fineCount,appliedReported=n.applied,gps=n.gps,localSensors=n.localSensors}end
+    end
+    for _,z in ipairs({'LF','RF','LB','RB'})do local v=m.zones and m.zones[z];if v then control[z]={main=v.main,sub=v.sub,fine=v.fine,fineLevels=v.fineLevels,signal=v.signal,phase=v.phase,total=v.total,target=v.target}end end
+    return {state=m.state,armed=m.armed,error=m.error,coreVersion=m.version,coreAge=finite(m.time) and (now-m.time)/1000 or nil,
+      fresh=fresh(m,1000),roles=m.roles,control={main=m.main,mainDemand=m.mainDemand,zones=control,vector=m.rotation,estimate=m.thrust},
+      attitude={angles=m.angles,recovery=m.recovery},nav={active=nav.active,mode=nav.commandMode,stage=nav.stage,state=nav.state,reason=nav.reason,
+        gps=nav.gps,fix=nav.fix,target=nav.target,bow=nav.yaw,actual=nav.actual,course=nav.course,courseTrusted=nav.courseTrusted,courseError=nav.courseError,
+        targetForward=nav.targetForward,turnAngle=nav.turnAngle,turnBoost=nav.turnBoost,yawSign=nav.yawSign,directionLock=nav.directionLock,
+        velocity=nav.velocity,landing=nav.landing,landingPhase=nav.landingPhase,targetVy=nav.targetVy,diagnostics=nav.directionDiagnostics},
+      sensor={name=d.sensor,present=d.present,ok=d.sensorOK,error=d.sensorError,gravity=d.gravity,rawAngles=d.rawAngles,
+        time=d.sensorTime,age=finite(d.sensorTime) and (now-d.sensorTime)/1000 or nil,relay=m.inputs,relayAge=m.relayAge,relayError=d.relayWarning,velocity=d.velocity},nodes=nodes}
+  end
+  function b.observe(m)
+    if not c.enabled or type(m)~='table'then return end
+    b.lastStatus=m;local now=os.epoch('utc');local nav=m.nav or {};local d=m.diagnostic or {}
+    local details={state=m.state,armed=m.armed,error=m.error,mode=nav.commandMode,stage=nav.stage,reason=nav.reason}
+    transition('session',m.session,'SYSTEM','CORE_SESSION',{session=m.session,version=m.version})
+    transition('state',tostring(m.state)..':'..tostring(m.armed)..':'..tostring(m.error),'SYSTEM','CONTROL_STATE',details,m.state=='FAULT' or m.state=='STOPPED')
+    transition('armed',m.armed==true,'SYSTEM',m.armed and 'ARM' or 'DISARM',details)
+    transition('mode',tostring(nav.active)..':'..tostring(nav.commandMode)..':'..tostring(nav.stage),'NAV','MODE_STAGE',details)
+    transition('recovery',m.recovery and m.recovery.active==true,'ATTITUDE','RECOVERY',{recovery=m.recovery,angles=m.angles})
+    transition('coreLink',fresh(m,1000),'NETWORK','CORE_LINK',{online=fresh(m,1000),time=m.time},not fresh(m,1000))
+    transition('sensor',tostring(d.sensorOK)..':'..tostring(d.sensorError)..':'..tostring(finite(d.sensorTime) and now-d.sensorTime<=500),'SENSOR','BODY_SENSOR',
+      {ok=d.sensorOK,error=d.sensorError,time=d.sensorTime},d.sensorOK==false)
+    for _,name in ipairs({'lateral','forward','vertical'})do local v=d.velocity and d.velocity[name]
+      transition('velocity:'..name,tostring(v and v.ok)..':'..tostring(v and v.error)..':'..tostring(v and finite(v.time) and now-v.time<=VELCFG.maxAge*1000),'SENSOR','VELOCITY_STATE',
+        {role=name,sensor=v and v.sensor,ok=v and v.ok,error=v and v.error,time=v and v.time})
+    end
+    transition('gps',tostring(nav.gps)..':'..tostring(nav.yaw and nav.yaw.reason),'SENSOR','GPS_BOW',{gps=nav.gps,bow=nav.yaw})
+    local vector=m.rotation or {}
+    transition('vector',tostring(vector.enabled)..':'..tostring(vector.left)..':'..tostring(vector.right)..':'..tostring(m.main),'CONTROL','VECTOR_MAIN',
+      {main=m.main,vector=vector,targetForward=nav.targetForward})
+    for _,id in ipairs({12,13,14,16,17,18,19})do local n=d.nodes and d.nodes[id]
+      local online=n and finite(n.time) and now-n.time<=CFG.nodeTimeout*1000
+      transition('node:'..id,tostring(online==true)..':'..tostring(n and n.ok)..':'..tostring(n and n.error)..':'..tostring(n and n.fineCount),'NODE','NODE_STATE',
+        {id=id,actualId=n and n.actualId,role=n and n.role,online=online==true,ok=n and n.ok,error=n and n.error,fineCount=n and n.fineCount},n and n.ok==false or not online)
+    end
+    transition('conflict',m.roles and m.roles.conflict or '', 'NETWORK','ROLE_CONFLICT',{error=m.roles and m.roles.conflict},m.roles and m.roles.conflict~=nil)
+    local warnings=nav.directionDiagnostics and nav.directionDiagnostics.warnings or {}
+    transition('directions',table.concat(warnings,','),'NAV','DIRECTION_DIAGNOSTICS',nav.directionDiagnostics)
+    for _,warning in ipairs(warnings)do
+      if b.signatures['warn:'..warning]~=true then b.event('NAV',warning,nav.directionDiagnostics,false)end
+      b.signatures['warn:'..warning]=true
+    end
+    for _,warning in ipairs({'BOW_COURSE_OPPOSITE','YAW_ERROR_GROWING','FORWARD_COMMAND_REVERSE_MOTION','YAW_BASELINE_INVALID','YAW_GPS_DEGRADED','VECTOR_DIRECTION_SUSPECT','BOW_UNVERIFIED'})do
+      local found=false;for _,v in ipairs(warnings)do found=found or v==warning end;if not found then b.signatures['warn:'..warning]=false end
+    end
+    if now-b.lastSnapshot>=c.interval*1000 then
+      b.lastSnapshot=now;local text=encode(record('SNAPSHOT','SHIP_STATE',summary(m,now)))
+      if text then
+        b.history[#b.history+1]={time=now,text=text};while #b.history>0 and (now-b.history[1].time>c.historySeconds*1000 or #b.history>120)do table.remove(b.history,1)end
+        enqueue(text,false,false)
+      end
+    end
+  end
+  function b.status()return {enabled=c.enabled,path='fleet_blackbox.log',events='fleet_blackbox_event.log',queued=#b.queue,history=#b.history,
+    written=b.written,dropped=b.dropped,error=b.error,lastWrite=b.lastWrite,lastEvent=b.lastEvent}end
+  local function size(path)
+    if not fs.exists(path)then return 0 end
+    assert(not fs.isDir(path),'Blackbox path is a directory')
+    if fs.getSize then return fs.getSize(path)end
+    local h=assert(fs.open(path,'r'));local v=h.readAll();h.close();return #v
+  end
+  local function append(group)
+    local path=group.event and 'fleet_blackbox_event.log' or 'fleet_blackbox.log'
+    local prev=group.event and 'fleet_blackbox_event_prev.log' or 'fleet_blackbox_prev.log'
+    local max=group.event and c.eventBytes or c.maxBytes
+    if size(path)+#group.text>max then
+      if fs.exists(prev)then assert(not fs.isDir(prev),'Blackbox previous path is a directory');fs.delete(prev)end
+      if fs.exists(path)then fs.move(path,prev)end
+    end
+    local free=assert(fs.getFreeSpace,'No free-space API')('')
+    for _,old in ipairs({'fleet_blackbox_prev.log','fleet_blackbox.log','fleet_blackbox_event_prev.log'})do
+      if free~='unlimited' and free<#group.text+c.reserve and fs.exists(old)then assert(not fs.isDir(old),'Blackbox cleanup path is a directory');fs.delete(old);free=fs.getFreeSpace('')end
+    end
+    assert(free=='unlimited' or type(free)=='number' and free>=#group.text+c.reserve,'Blackbox Out of space; protected code/rollback files untouched')
+    local h,why=fs.open(path,'a');assert(h,why);local ok,err=pcall(h.write,group.text);h.close();assert(ok,err)
+    b.written=b.written+1;b.lastWrite=os.epoch('utc');b.error=nil
+  end
+  function b.flush()
+    if not c.enabled or os.clock()<b.retry then return end
+    for _=1,2 do
+      local index
+      for i,g in ipairs(b.queue)do if g.critical then index=i;break end end
+      index=index or 1;local group=b.queue[index];if not group then return end
+      local ok,err=pcall(append,group)
+      if not ok then b.error=tostring(err);b.retry=os.clock()+5;return end
+      table.remove(b.queue,index)
+    end
+  end
+  function b.safeObserve(m)local ok,err=pcall(b.observe,m);if not ok then b.error=tostring(err)end end
+  function b.accept(m)
+    if type(m)~='table' or m.magic~=LOG_MAGIC or m.key~=setting('fleet.admin_key','') or not fresh(m,10000)
+      or type(m.id)~='string' or #m.id>150 or type(m.category)~='string' or #m.category>20 or type(m.code)~='string' or #m.code>80
+      or type(m.data)~='table' or not ROLE or not ROLE.roles[m.source] or not finite(m.actualId) or ROLE.resolve(m.source)~=m.actualId then return false end
+    if b.seen[m.id]then return false end;b.seen[m.id]=os.clock()
+    b.event(m.category,m.code,m.data,m.category=='SAFETY' or m.data.error~=nil,m)
+    return true
+  end
+  function b.worker()
+    b.event('SYSTEM','BLACKBOX_START',{version=VERSION,interval=c.interval,config=c})
+    while true do
+      if b.lastStatus then b.safeObserve(b.lastStatus)end
+      local ok,err=pcall(b.flush);if not ok then b.error=tostring(err);b.retry=os.clock()+5 end
+      for k,t in pairs(b.seen)do if os.clock()-t>30 then b.seen[k]=nil end end
+      sleep(0.2)
+    end
+  end
+  return b
+end
+if args[1]=='test_api' then return {logClean=logClean,newBlackbox=newBlackbox,directionDiagnostics=directionDiagnostics,rolesFactory=newRoles,discoverFine=discoverFine,modecfg=MODECFG,verticalHold=verticalHold,manualStep=manualStep,hoverStep=hoverStep,testStep=testStep,finishTest=finishTest,testRecords=function(nav)return TEST_RECORDS[nav]end,cruisecfg=CRUISECFG,directionLock=directionLock,resetCruise=resetCruise,brakingModel=brakingModel,velocityValues=velocityValues,applyVelocity=applyVelocity,speedGuard=speedGuard,cruiseCommand=cruiseCommand,velcfg=VELCFG,geometry=geometry,zones=zones,allocate=allocate,rotationValues=rotationValues,cfg=CFG,navcfg=NAVCFG,axisDemand=axisDemand,navMetrics=navMetrics,newMixer=newMixer,mixStep=mixStep,estimate=estimate,balance=balance,thrust=THRUST,recoveryState=recoveryState,recoverycfg=RECOVERY,newRecovery=newRecovery,recoveryStep=recoveryStep,recoveryDemand=recoveryDemand,navStep=navStep,ingestGPS=ingestGPS,navGPSState=navGPSState,suspendGPS=suspendGPS,navHold=navHold,yawcfg=YAWCFG,landcfg=LANDCFG,yawPose=yawPose,yawCommand=yawCommand,wrapAngle=wrapAngle,sampleGPS=sampleGPS,landingProfile=landingProfile,landingStep=landingStep,landingStage=landingStage} end
 local function managedStop()
   while true do
     local _,id=os.pullEvent('fleet_managed_stop')
@@ -1341,6 +1563,8 @@ local function node(id)
     end
   end
   local function report()
+    local lastEvent;local localFaults={}
+    emitLog('SYSTEM','NODE_START',{id=id,version=VERSION})
     while true do
       if FINE[id] then
         for _,name in ipairs(names) do
@@ -1350,6 +1574,13 @@ local function node(id)
         end
       end
       local active=false;for _,v in pairs(applied) do if v>0 then active=true end end
+      for role,sample in pairs(localSensors)do
+        local failure=sample.ok==false and tostring(sample.error or 'Local sensor failed') or nil
+        if failure~=localFaults[role]then localFaults[role]=failure;emitLog('SENSOR',failure and 'LOCAL_SENSOR_ERROR' or 'LOCAL_SENSOR_RECOVERED',
+          {id=id,role=role,name=sample.name,error=failure,bodyReference=false})end
+      end
+      local event=tostring(healthy)..':'..tostring(errorText)..':'..tostring(#names)
+      if event~=lastEvent then lastEvent=event;emitLog(healthy and 'NODE' or 'SAFETY',healthy and 'NODE_READY' or 'NODE_FAULT',{id=id,error=errorText,fineCount=FINE[id] and #names,appliedReported=applied})end
       runtime(healthy and 'OUTPUT NODE' or 'FAULT',active,errorText)
       send(10,{kind='NODE',session=session,id=id,ok=healthy,error=errorText,
         localSensors=FINE[id] and localSensors or nil,fineCount=FINE[id] and #names or nil,fineNames=FINE[id] and names or nil,role=ROLE.role,actualId=ROLE.actual,seq=lastSeq,applied=applied,gps=not FINE[id] and nodeGPS or nil,version=VERSION,state=healthy and
@@ -1365,7 +1596,7 @@ local function node(id)
   local function keyboard()
     while true do local _,k=os.pullEvent('key');if k==keys.q then return end end
   end
-  local ok,err=pcall(function() parallel.waitForAny(receiver,writer,report,keyboard,managedStop,gpsReader,roleWorker,localSensorReader) end)
+  local ok,err=pcall(function() parallel.waitForAny(receiver,writer,report,keyboard,managedStop,gpsReader,roleWorker,localSensorReader,logSender) end)
   force=true
   parallel.waitForAny(function()pcall(write,zero)end,function()sleep(CFG.stopWriteTimeout)end)
   stopWire()
@@ -1407,6 +1638,7 @@ local function controller()
   local navFix,navPrevious,pilotSeen,navFixTime=nil,nil,-math.huge,nil
   local gpsTrack={}
   local yawTrack={}
+  local directionTrack={}
   local velocityPacket={}
   local function gpsReader() bodyGPS(10,function(g)health[10]={ok=true,time=os.epoch('utc'),gps=g} end) end
   local requestSeq,requestAck={},{}
@@ -1420,6 +1652,7 @@ local function controller()
     nav.active=false;nav.targetForward=0;nav.turnBoost=0;nav.turnAngle=0;nav.yawAligned=false;nav.courseTrusted=false;nav.state=state or 'NAV CANCELLED';nav.reason=reason
   end
   local function stop(reason)
+    emitLog(reason=='FAULT' and 'SAFETY' or 'SYSTEM',reason,{reason=faultText or reason,state=state})
     cancelNav(reason=='FAULT' and 'NAV FAULT' or 'NAV CANCELLED',reason=='FAULT' and (faultText or 'Flight control fault') or 'Flight stopped')
     rotation={enabled=false,left=0,right=0}
     armed=false;enabled=false;baseMain=0;mixer=newMixer(mixer.counts);recovery=newRecovery();thrustState={total=0}
@@ -1593,6 +1826,7 @@ local function controller()
             if not requestSeq[k] or m.seq>requestSeq[k] then
               requestSeq[k]=m.seq
               local ok,reason=pilot(m)
+              emitLog('EVENT','PILOT_ACK',{action=m.action,client=k,seq=m.seq,ok=ok,reason=reason,target=m.target})
               requestAck[k]={kind='PILOT_ACK',client=k,seq=m.seq,ok=ok,reason=reason,session=session,level='COMMAND ACCEPTED'}
             end
             if requestAck[k] and requestAck[k].seq==m.seq then send(11,requestAck[k]) end
@@ -1744,7 +1978,7 @@ local function controller()
           right=rotation.enabled and (rotation.appliedRight or rotation.right) or 0,outputs=rotationValues(rotation.enabled and (rotation.appliedLeft or rotation.left) or 0,rotation.enabled and (rotation.appliedRight or rotation.right) or 0)},angles=sensorTime and {roll=roll,pitch=pitch,time=sensorTime},
         diagnostic={sensor=CFG.sensor,sensorOK=sensorOK,sensorError=sensorError,present=sensorPresent,
           angleOK=angleOK,angleError=angleError,gravity=rawGravity,rawAngles=rawAngles,angleTime=angleTime,
-          sensorTime=sensorTime,relayWarning=relayWarning,relayAge=os.clock()-relaySeen,
+          sensorTime=sensorTime,velocity=velocityPacket,relayWarning=relayWarning,relayAge=os.clock()-relaySeen,
           relays=RELAYS,nodes=health,deadzone=CFG.deadzone}})
       sleep(0.25)
     end
@@ -1760,7 +1994,7 @@ local function controller()
     local lastNavClock=os.clock()
     while true do
       local navDt=clamp(os.clock()-lastNavClock,0,0.2);lastNavClock=os.clock()
-      local pose=yawPose(health,nav.target,os.epoch('utc'),yawTrack);nav.yaw=pose
+      local pose=yawPose(health,nav.target,os.epoch('utc'),yawTrack,navFix);nav.yaw=pose
       nav.velocity=velocityValues(velocityPacket,os.epoch('utc'))
       nav.limits={forward=VELCFG.forwardLimit,reverse=VELCFG.reverseLimit,cruise=VELCFG.cruiseSpeed}
       nav.gps=navGPSState(gpsTrack,os.epoch('utc'));nav.gpsAge=navFix and (os.epoch('utc')-navFix.time)/1000 or nil
@@ -1797,6 +2031,7 @@ local function controller()
           local l,r=yawCommand(nav,pose,navDt,os.epoch('utc'));rotation={enabled=true,left=l,right=r}
         end
       end
+      nav.directionDiagnostics=directionDiagnostics(nav,rotation,os.epoch('utc'),directionTrack)
       sleep(0.1)
     end
   end
@@ -1814,7 +2049,7 @@ local function controller()
       if k==keys.space then stop('STOPPED') elseif k==keys.q then return end
     end
   end
-  local ok,err=pcall(function() parallel.waitForAny(loop,receiver,report,angleReader,navigation,keyboard,managedStop,gpsReader,roleWorker,testLogger) end)
+  local ok,err=pcall(function() parallel.waitForAny(loop,receiver,report,angleReader,navigation,keyboard,managedStop,gpsReader,roleWorker,testLogger,logSender) end)
   stop('STOPPED');stopWire()
   if not ok then
     if FLEET_RUN then os.queueEvent('fleet_run_error',os.getComputerID(),tostring(err),FLEET_RUN) end
@@ -1829,8 +2064,10 @@ local function ui()
   local rotation={enabled=false,left=0,right=0}
   local relaySequence=0
   local relayError
+  local blackbox=newBlackbox()
   local localClient='11:'..uid()
   local radioOwned={}
+  local logOwned={}
   local function gpsReader()
     bodyGPS(11,function(g)if session then send(10,{kind='BODY_GPS',session=session,gps=g}) end end)
   end
@@ -1844,6 +2081,7 @@ local function ui()
         local stamp=os.epoch('utc')
         local axisOK,axis=pcall(peripheral.call,name,'getAxis')
         values[r]={ok=ok and finite(value),value=ok and finite(value) and value*VELCFG[r..'Sign'] or nil,
+          error=not ok and tostring(value):sub(1,200) or not finite(value) and 'Invalid velocity value' or nil,
           axis=axisOK and tostring(axis):sub(1,20) or '?',time=stamp,sensor=name}
         sleep(VELCFG.pollSeconds)
       end end
@@ -1860,6 +2098,7 @@ local function ui()
   local function pilot(action,client,number,target)
     if not session then return end
     if not client then seq=seq+1;client=localClient;number=seq end
+    blackbox.event('EVENT','PILOT_REQUEST',{action=action,client=client,seq=number,target=target})
     send(10,{kind='PILOT',session=session,client=client,seq=number,action=action,target=target})
   end
   local function transmit(channel,m)
@@ -1927,12 +2166,39 @@ local function ui()
     while true do
       local from,m=receiveFlight(PROTO)
       if from==10 and fresh(m,1000) and m.kind=='PILOT_ACK' then
+        blackbox.event('EVENT','PILOT_ACK',{client=m.client,seq=m.seq,ok=m.ok,reason=m.reason})
         transmit(ACK_CHANNEL,{protocol='fleet_ack_v1',source=11,ack=m,time=os.epoch('utc')})
       elseif from==10 and fresh(m,1000) and m.kind=='STATUS' and type(m.session)=='string' then
         if session~=m.session then enabled=false;main=0;seq=0;session=m.session;rotation={enabled=false,left=0,right=0} end
         status=m;received=os.clock();enabled=m.armed==true;main=m.main or 0
         if m.rotation then rotation=m.rotation end
         if m.error or m.state=='STOPPED' then enabled=false;main=0;rotation={enabled=false,left=0,right=0} end
+        blackbox.safeObserve(m)
+      end
+    end
+  end
+  local function blackboxRadio()
+    local lastScan=-math.huge
+    if not blackbox.config.enabled then while true do sleep(60)end end
+    while true do
+      if os.clock()-lastScan>=1 then lastScan=os.clock();pcall(function()for _,side in ipairs(redstone.getSides())do if peripheral.hasType(side,'modem')then
+        if not peripheral.call(side,'isOpen',LOG_CHANNEL)then peripheral.call(side,'open',LOG_CHANNEL);logOwned[side]=true end
+      end end end)end
+      local e,side,ch,reply,m=os.pullEventRaw()
+      if e=='fleet_blackbox_admin' and side==ROLE.actual then pcall(blackbox.accept,ch)end
+      if e=='modem_message' then
+        pcall(function()
+          if ch==LOG_CHANNEL then blackbox.accept(m)
+          elseif (ch==42615 or ch==42616) and type(m)=='table' and m.magic=='fleet_admin_v1' and m.key==setting('fleet.admin_key','') and fresh(m,10000)
+            and type(m.rid)=='string' and #m.rid<=120 and type(m.op)=='string' and type(m.body)=='table'then
+            local body=m.body;local key='admin:'..m.rid..':'..m.op..':'..tostring(body.state)
+            if not blackbox.seen[key] and m.op~='FILE_CHUNK' and (m.op~='RESULT' or body.state~='RECEIVED')then
+              blackbox.seen[key]=os.clock();local info=body.info or {}
+              blackbox.event('ADMIN',m.op,{from=m.from,to=m.to,rid=m.rid,state=body.state,detail=body.detail,token=body.token,
+                version=info.adminVersion,running=info.runningCode,files=info.files},body.state=='FAILED')
+            end
+          end
+        end)
       end
     end
   end
@@ -2033,9 +2299,9 @@ local function ui()
       end
     end
     local nav=status.nav or {};local y=nav.yaw or {}
-    add('BODY YAW: configured 10..14 cluster minus 15; 16..19 FINE ONLY')
+    add('BOW: 12 LEFT -> 13 RIGHT, perpendicular X/Z; Fine GPS unused')
     add('RAW YAW '..tostring(y.rawYaw)..' / offset '..tostring(y.offset)..' / baseline '..tostring(y.baseline))
-    add('set fleet.yaw_offset (known bow - RAW); restart 10')
+    add('CORE fleet.bow_sign=1/-1; RAW +1; optional fleet.bow_offset')
     local vel=nav.velocity or {}
     add('VEL 1 lateral '..tostring(vel.lateral)..' / 2 forward '..tostring(vel.forward)..' / 3 vertical '..tostring(vel.vertical))
     add('Axes diagnostic ONLY: '..tostring(vel.lateralAxis)..' / '..tostring(vel.forwardAxis)..' / '..tostring(vel.verticalAxis))
@@ -2046,11 +2312,13 @@ local function ui()
     add('YAW '..tostring(y.valid==true)..' / '..tostring(y.reason)..' / FIXES '..tostring(y.fixes or 0))
     if y.valid then
       add(string.format('Bow %.2f / target %s / error %s / rate %s',y.yaw,tostring(y.targetYaw),tostring(y.error),y.rateValid and tostring(y.rate) or 'FIRST FRAME'))
-      add(string.format('Front X/Z %.2f %.2f / rear %.2f %.2f',y.front.x,y.front.z,y.rear.x,y.rear.z))
+      add(string.format('LEFT 12 X/Z %.2f %.2f / RIGHT 13 %.2f %.2f',y.left.x,y.left.z,y.right.x,y.right.z))
       add(string.format('Center %.2f %.2f %.2f / baseline %.2f / skew %.3fs',y.center.x,y.center.y,y.center.z,y.baseline,y.skew))
     end
     add(string.format('TURN %s / boost %.2f command base; LEVEL has priority',nav.turnDirection or 'NONE',nav.boostApplied or 0))
     if nav.landing then add('LANDING '..tostring(nav.landingPhase)..' VY '..tostring(nav.verticalSpeed)..' -> '..tostring(nav.targetVy));add('Target GPS Y offset '..LANDCFG.yOffset..'; no ground contact sensing') end
+    local logs=blackbox.status();add('BLACKBOX 11 '..(logs.enabled and 'ON' or 'OFF')..' queued '..logs.queued..' dropped '..logs.dropped)
+    if logs.error then add('LOG WARNING '..logs.error:sub(1,120))end
     add('Reports = successful writes, NOT measured thrust')
     add('Node reports may lag commands by 0.25s+')
     return out
@@ -2081,7 +2349,7 @@ local function ui()
                 state={result=status.state,stages={'--','--','--'},radio='VIA 11',cycle=status.seq,lines=text},
                 telemetry={version=1,session=status.session,seq=status.seq,time=status.time,state=status.state,
                   inputs=status.inputs,relayAge=status.relayAge,zones=status.zones,error=status.error or relayError,angles=status.angles,diagnosticLines=diagnostics(),thrust=status.thrust,nodes=nodeReports(),rotation=status.rotation,
-                  roles=status.roles,nav=status.nav,recovery=status.recovery,main=status.main,mainCommand=status.mainCommand,mainDemand=status.mainDemand,armed=status.armed,deadzone=status.deadzone,sensor={name=(status.diagnostic or {}).sensor,present=(status.diagnostic or {}).present,ok=(status.diagnostic or {}).sensorOK,
+                  blackbox=blackbox.status(),roles=status.roles,nav=status.nav,recovery=status.recovery,main=status.main,mainCommand=status.mainCommand,mainDemand=status.mainDemand,armed=status.armed,deadzone=status.deadzone,sensor={name=(status.diagnostic or {}).sensor,present=(status.diagnostic or {}).present,ok=(status.diagnostic or {}).sensorOK,
                     time=(status.diagnostic or {}).sensorTime,error=(status.diagnostic or {}).sensorError}}})
             end
           end
@@ -2101,8 +2369,10 @@ local function ui()
       elseif not held and actionKeys[k] then pilot(actionKeys[k]) end
     end
   end
-  local ok,err=pcall(function() parallel.waitForAny(receiver,relayReader,heartbeat,display,keyboard,radioLoop,remote,managedStop,gpsReader,velocityReader,roleWorker) end)
+  local ok,err=pcall(function() parallel.waitForAny(receiver,relayReader,heartbeat,display,keyboard,radioLoop,remote,managedStop,gpsReader,velocityReader,roleWorker,blackbox.worker,blackboxRadio) end)
+  blackbox.event('SYSTEM','BLACKBOX_STOP',{reason='SENSOR_UI stopped'},true);pcall(blackbox.flush)
   off();stopWire()
+  for side in pairs(logOwned)do pcall(peripheral.call,side,'close',LOG_CHANNEL)end
   for side in pairs(radioOwned) do pcall(peripheral.call,side,'close',UI_CHANNEL) end
   if not ok then
     if FLEET_RUN then os.queueEvent('fleet_run_error',os.getComputerID(),tostring(err),FLEET_RUN) end

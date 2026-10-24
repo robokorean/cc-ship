@@ -82,7 +82,7 @@ local function discoverFine(strict)
 end
 local ROLE=FLEET_ROLES or (args[1]~='test_api' and newRoles() or nil)
 local DEPLOY_VERBOSE=false
-local ADMIN_VERSION='2026.10.20-r16'
+local ADMIN_VERSION='2026.10.24-r17'
 local REQUEST=42615
 local RESPONSE=42616
 local MAGIC='fleet_admin_v1'
@@ -283,16 +283,52 @@ local updateSuccess
 local commandRunning=false
 local lastReportDetail
 local bundleSource
+local auditQueue={}
+local auditState={written=0,dropped=0,error=nil,path='fleet_admin_audit.log'}
+local function audit(code,data)
+  local r={magic='fleet_log_v1',key=settings.get('fleet.admin_key',''),id='admin:'..uid(),source=15,actualId=ROLE.actual,role=ROLE.role,
+    category='ADMIN',code=code,time=now(),version=ADMIN_VERSION,data=data or {}}
+  r.data.command=activeCommand;r.data.stage=updateStage;r.data.bundle=bundleSource
+  auditQueue[#auditQueue+1]=r
+  if #auditQueue>128 then table.remove(auditQueue,1);auditState.dropped=auditState.dropped+1 end
+end
+local function auditFlush()
+  local batch,bytes={},0
+  for _=1,8 do local r=table.remove(auditQueue,1);if not r then break end
+    local safe={schema=1,time=r.time,id=r.id,source=r.actualId,role=r.role,version=r.version,category=r.category,code=r.code,data=r.data}
+    local ok,s=pcall(function()if textutils.serializeJSON then return textutils.serializeJSON(safe)end;return textutils.serialize(safe):gsub('\n',' ')end)
+    if ok then
+      if #s>4000 then safe.data={truncated=true,id=r.data.id,op=r.data.op,result=r.data.result,detail=tostring(r.data.detail or ''):sub(1,500),bundle=bundleSource};s=textutils.serialize(safe):gsub('\n',' ')end
+      if bytes+#s+1>8192 then table.insert(auditQueue,1,r);break end
+      batch[#batch+1]=s..'\n';bytes=bytes+#s+1
+      pcall(function()for _,modem in ipairs(net.scan())do pcall(peripheral.call,modem.side,'transmit',42618,42618,r)end end)
+    else auditState.error=tostring(s);auditState.dropped=auditState.dropped+1 end
+  end
+  if #batch==0 then return end
+  local ok,err=pcall(function()
+    local data=table.concat(batch);local path='fleet_admin_audit.log';local prev='fleet_admin_audit_prev.log'
+    local size=fs.exists(path) and #readFile(path) or 0
+    if size+#data>8192 then if fs.exists(prev)then assert(not fs.isDir(prev),'Audit previous path is a directory');fs.delete(prev)end;if fs.exists(path)then fs.move(path,prev)end end
+    local free=assert(fs.getFreeSpace,'Audit storage status unavailable')('')
+    if free~='unlimited' and free<#data+32768 and fs.exists(prev)then assert(not fs.isDir(prev),'Audit previous path is a directory');fs.delete(prev);free=fs.getFreeSpace('')end
+    assert(free=='unlimited' or type(free)=='number' and free>=#data+32768,'ADMIN audit storage low; code/update files protected')
+    local h,why=fs.open(path,'a');assert(h,why);local good,problem=pcall(h.write,data);h.close();assert(good,problem)
+    auditState.written=auditState.written+#batch;auditState.error=nil
+  end)
+  if not ok then auditState.error=tostring(err);auditState.dropped=auditState.dropped+#batch end
+end
+local function auditWorker()while true do pcall(auditFlush);sleep(0.2)end end
 local function saveReport(detail)
   if detail then lastReportDetail=detail end
   detail=lastReportDetail
-  return pcall(writeFile,'fleet_deploy_last.txt',textutils.serialize({version=ADMIN_VERSION,source=bundleSource,command=activeCommand,time=now(),targets=outcomes,detail=detail,stage=updateStage,busy=commandRunning,finished=updateFinished,success=updateSuccess}))
+  return pcall(writeFile,'fleet_deploy_last.txt',textutils.serialize({version=ADMIN_VERSION,source=bundleSource,audit=auditState,command=activeCommand,time=now(),targets=outcomes,detail=detail,stage=updateStage,busy=commandRunning,finished=updateFinished,success=updateSuccess}))
 end
 local function log(id,state,detail)
   if DEPLOY_VERBOSE or activeCommand~='UPDATE' or state=='FAILED' or state=='OFFLINE' or state=='UNREACHABLE' or state=='TIMEOUT' then print(string.format('%s %s %-12s %s',tostring(ROLE.resolve(id) or id),ROLE.roles[id] or '',state,tostring(detail or ''))) end
   outcomes[id]=outcomes[id] or {};local o=outcomes[id]
   o.actualId=ROLE.resolve(id);o.role=ROLE.roles[id];o.state=state;o.detail=detail;o.time=now();o.history=o.history or {};o.history[#o.history+1]=state;o.events=o.events or {};o.events[#o.events+1]={state=state,detail=detail,time=now()};while #o.events>16 do table.remove(o.events,1) end
   while #o.history>32 do table.remove(o.history,1) end
+  if state~='SENT' and state~='RECEIVED' and state~='UNCHANGED' then audit(state,{id=ROLE.resolve(id),role=ROLE.roles[id],detail=tostring(detail or ''):sub(1,500)})end
   saveReport()
 end
 local function sendRequest(packet,priority)
@@ -351,6 +387,9 @@ local function receiver()
         slot.received=true
         local changed=not slot.response or slot.response.state~=m.body.state
         slot.response=m.body
+        if changed and slot.op~='FILE_CHUNK' and slot.op~='FILE_BEGIN' and m.body.state~='RECEIVED' then
+          local i=m.body.info or {};audit('RESULT',{id=ROLE.resolve(slot.id),role=ROLE.roles[slot.id],op=slot.op,result=m.body.state,rid=m.rid,detail=m.body.detail,running=i.runningCode,files=i.files,boot=i.boot})
+        end
         if changed and slot.op~='FILE_CHUNK' then
           local route={};for _,id in ipairs(m.route) do route[#route+1]=tostring(id) end
           log(slot.id,m.body.state,(m.body.detail or '')..' [reply '..table.concat(route,'>')..'>15]')
@@ -372,7 +411,7 @@ local function updateFleet(command)
     log(id,'FAILED','Maintenance heartbeat recheck timeout');return nil
   end
   local stage='STOPPING'
-  local function phase(p) if not DEPLOY_VERBOSE then print(p..'...') end;stage=p;updateStage=p;saveReport() end
+  local function phase(p) if not DEPLOY_VERBOSE then print(p..'...') end;stage=p;updateStage=p;audit('PHASE',{phase=p});saveReport() end
   print('UPDATE START')
   local function many(fn)
     local tasks={};for _,id in ipairs(command.targets) do local n=id;tasks[#tasks+1]=function()fn(n)end end
@@ -622,11 +661,15 @@ end
 
 local function runCommand(command)
   outcomes={};activeCommand=command.op
+  if command.op=='UPDATE'then bundleSource=nil end
+  audit('COMMAND_START',{op=command.op,targets=command.targets,grounded=command.grounded})
   if command.op=='UPDATE' then
     updateFinished=false;updateSuccess=nil;bundleSource=nil
     local protected,ok,detail=pcall(updateFleet,command)
     if not protected then detail=tostring(ok);ok=false;if FLEET15 and FLEET15.rollbackSelf then pcall(FLEET15.rollbackSelf) end end
     updateFinished=true;updateSuccess=ok;updateStage=ok and 'UPDATE COMPLETE' or 'UPDATE FAILED';saveReport(detail)
+    audit(ok and 'UPDATE_COMPLETE' or 'UPDATE_FAILED',{ok=ok,detail=detail})
+    for _=1,128 do if #auditQueue==0 then break end;pcall(auditFlush)end
     print((ok and 'UPDATE SUCCESS: ' or 'UPDATE FAILED: ')..detail)
     for _,id in ipairs(command.targets) do local o=outcomes[id];print(tostring(id)..' '..(o and o.state or 'NOT RUN')..(o and o.rollback and (' / '..o.rollback) or '')) end
     return
@@ -680,6 +723,8 @@ local function runCommand(command)
   local report={version=ADMIN_VERSION,command=command.op,time=now(),targets=outcomes}
   local ok,err=pcall(writeFile,'fleet_deploy_last.txt',textutils.serialize(report))
   if not ok then print('Could not save last report: '..tostring(err)) end
+  audit('COMMAND_FINISH',{op=command.op})
+  for _=1,128 do if #auditQueue==0 then break end;pcall(auditFlush)end
   print('--- TARGET RESULTS ---')
   for _,id in ipairs(command.targets) do
     local o=outcomes[id];print(string.format('%02d %s',id,o and o.state or 'FAILED'))
@@ -732,7 +777,7 @@ local function emergency()
   end
 end
 if FLEET15_HEALTH then FLEET15_HEALTH(ADMIN_VERSION) end
-local ok,err=pcall(function()parallel.waitForAny(receiver,console,uiRequests,emergency,ROLE.run)end)
+local ok,err=pcall(function()parallel.waitForAny(receiver,console,uiRequests,emergency,ROLE.run,auditWorker)end)
 net.close()
 if not ok then print('Deploy stopped: '..tostring(err)) end
 
