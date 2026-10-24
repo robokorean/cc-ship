@@ -83,7 +83,7 @@ local function discoverFine(strict)
   return names
 end
 local ROLE=FLEET_ROLES or (args[1]~='test_api' and newRoles() or nil)
-local VERSION='2026.10.24-r18'
+local VERSION='2026.10.24-r19'
 local CFG={tick=0.05,finePower=1,nodeTimeout=1,commandTimeout=3,
   stopWriteTimeout=0.75,
   relayTimeout=0.5,assistDelay=3,assistRise=1,releaseRate=8,mainSlew=4,
@@ -94,14 +94,15 @@ local NAVCFG={courseVerified=true,yawSign=1,hoverMain=9,maxMain=10,maxVector=18,
   stableTilt=5,stableRate=3,stabilizeSeconds=3,probeVector=24,probeSeconds=4,probeHoldSeconds=3,
   probeFixes=2,probeDistance=1,probeMaxSpeed=1.5,courseTimeout=5,
   alignDegrees=15,turnSeconds=3,brakeVector=6}
-local YAWCFG={bodyIds={12,13},bowSign=nil,yawOffset=0,maxAge=2,maxSkew=0.75,minBaseline=3,maxCluster=20,baselineTolerance=0.1,
+local YAWCFG={bodyIds={12,13},bowSign=1,bowSignSource='DEFAULT_LEFT_RIGHT_UP',yawOffset=0,maxAge=2,maxSkew=0.25,
+  mountDistance=5,mountTolerance=1.25,minHorizontal=1.5,recoverFixes=3,maxTilt=70,
   maxRate=120,rateFilter=0.4,alignError=5,exitError=10,settleRate=2,alignSeconds=1,
   prediction=1,fineBand=15,maxVector=24,vectorRate=12,maxBoost=1,boostRise=0.5,boostFall=2,
   slipDegrees=60,slipSpeed=1,gpsLocateTimeout=2.5,gpsPollSeconds=0.5}
 local LANDCFG={far=50,middle=20,near=5,fast=2,medium=1,slow=0.5,creep=0.2,
   tolerance=0.75,holdSpeed=0.25,positionGain=0.2,velocityGain=0.8,maxAscent=1,
   prediction=3,excessSpeed=0.5,brakeRise=2,resumeSeconds=3,exitRadius=1.5,yOffset=0}
--- CORE: fleet.bow_sign=+1/-1; optional fleet.bow_offset. 0=X+, 90=Z+.
+-- CORE: 12=LEFT, 13=RIGHT. Default bow uses body-up convention; fleet.bow_sign=-1 is exceptional reversal. 0=X+, 90=Z+.
 -- ID 11: fleet.velocity_lateral_sign / forward_sign / vertical_sign = +1 or -1.
 local VELCFG={maxAge=0.5,pollSeconds=0.1,lateralSign=1,forwardSign=1,verticalSign=1,
   forwardLimit=50,reverseLimit=30,limitMargin=2,cruiseSpeed=3,acceleration=0.5,
@@ -116,9 +117,23 @@ local function setting(name,default)
   if settings and settings.get then local ok,v=pcall(settings.get,name,default);if ok then return v end end
   return default
 end
-YAWCFG.bowSign=tonumber(setting('fleet.bow_sign',nil))
+do
+  local raw=setting('fleet.bow_sign',nil)
+  if raw==nil then YAWCFG.bowSign=1;YAWCFG.bowSignSource='DEFAULT_LEFT_RIGHT_UP'
+  else
+    local v=tonumber(raw)
+    if v==1 or v==-1 then YAWCFG.bowSign=v;YAWCFG.bowSignSource='EXPLICIT_OVERRIDE'
+    else YAWCFG.bowSign=nil;YAWCFG.bowSignSource='INVALID_SETTING' end
+  end
+end
 YAWCFG.yawOffset=tonumber(setting('fleet.bow_offset',0))
 YAWCFG.legacyOffset=setting('fleet.yaw_offset',nil)
+do
+  local v=tonumber(setting('fleet.yaw_mount_tolerance',YAWCFG.mountTolerance));if v and v==v and v>=0.25 and v<=2 then YAWCFG.mountTolerance=v end
+  v=tonumber(setting('fleet.yaw_horizontal_min',YAWCFG.minHorizontal));if v and v==v and v>=0.5 and v<=4.5 then YAWCFG.minHorizontal=v end
+  v=tonumber(setting('fleet.yaw_recover_fixes',YAWCFG.recoverFixes));if v and v==v and v>=2 and v<=10 then YAWCFG.recoverFixes=math.floor(v) end
+  v=tonumber(setting('fleet.yaw_max_tilt',YAWCFG.maxTilt));if v and v==v and v>=30 and v<=85 then YAWCFG.maxTilt=v end
+end
 for _,role in ipairs({'lateral','forward','vertical'}) do
   local v=tonumber(setting('fleet.velocity_'..role..'_sign',1))
   VELCFG[role..'Sign']=(v==1 or v==-1) and v or 1
@@ -528,12 +543,23 @@ local function sampleGPS(last,id,ok,x,y,z,time)
   last.failures=(last.failures or 0)+1;last.error=not ok and tostring(x) or 'NO FIX'
   return last
 end
-local function yawPose(nodes,target,time,track,position)
+local function yawPose(nodes,target,time,track,position,attitude)
   track=track or {}
   local ids={12,13}
   local q={valid=false,fixes=0,required=2,source='GPS_LR_12_13',reason='BOW GPS DEGRADED',time=time,
-    offset=YAWCFG.yawOffset,bowSign=YAWCFG.bowSign,bodyIds=ids,samples={}}
-  local function invalid(code,reason)q.reasonCode=code;q.reason=reason;track.pose=nil;track.times=nil;return q end
+    offset=YAWCFG.yawOffset,bowSign=YAWCFG.bowSign,bowSignSource=YAWCFG.bowSignSource,bodyIds=ids,samples={},
+    expectedDistance=YAWCFG.mountDistance,mountTolerance=YAWCFG.mountTolerance,minHorizontal=YAWCFG.minHorizontal,
+    recoveryRequired=YAWCFG.recoverFixes,recoveryFixes=track.goodFrames or 0,tilt=attitude and attitude.tilt}
+  local function latchInvalid(code,reason)
+    q.reasonCode=code;q.reason=reason;q.recoveryFixes=0
+    track.recovering=true;track.goodFrames=0;track.pose=nil;track.times=nil
+    return q
+  end
+  local function recovering(reason)
+    q.reasonCode='YAW_RECOVERING';q.reason=reason;q.recoveryFixes=track.goodFrames or 0
+    track.pose=nil;track.times=nil
+    return q
+  end
   local function finish()
     q.valid=true;q.age=(time-q.time)/1000
     q.targetOrigin=validPosition(position) and position or q.center;q.targetSource=validPosition(position) and 'NAV GPS' or '12/13 MIDPOINT'
@@ -559,23 +585,43 @@ local function yawPose(nodes,target,time,track,position)
     end
     q.samples[id]={state=state,x=g and g.x,y=g and g.y,z=g and g.z,time=g and g.time,sampleTime=g and g.sampleTime,error=g and g.error}
   end
-  if q.fixes~=2 then return invalid('YAW_GPS_DEGRADED','12 '..q.samples[12].state..' / 13 '..q.samples[13].state)end
+  if q.fixes~=2 then return latchInvalid('YAW_GPS_DEGRADED','12 '..q.samples[12].state..' / 13 '..q.samples[13].state)end
   q.oldest=oldest;q.skew=(newest-oldest)/1000
-  if q.skew>YAWCFG.maxSkew then return invalid('YAW_GPS_DEGRADED','12/13 GPS sample skew')end
+  if q.skew>YAWCFG.maxSkew then return latchInvalid('YAW_GPS_DEGRADED','12/13 GPS sample skew')end
   local left,right=points[12],points[13];q.left=left;q.right=right
   q.center={x=(left.x+right.x)/2,y=(left.y+right.y)/2,z=(left.z+right.z)/2}
-  local dx,dz=right.x-left.x,right.z-left.z;q.lr={x=dx,z=dz}
-  q.baseline=math.sqrt(dx*dx+dz*dz);q.rawYaw=wrapAngle(atanDeg(-dx,dz))
-  if q.baseline<YAWCFG.minBaseline then return invalid('YAW_BASELINE_INVALID','12/13 horizontal baseline too short')end
-  if track.baseline and math.abs(q.baseline-track.baseline)>math.max(2,track.baseline*YAWCFG.baselineTolerance)then return invalid('YAW_BASELINE_INVALID','12/13 baseline length changed; verify mounts')end
-  track.baseline=track.baseline or q.baseline
-  if YAWCFG.bowSign~=1 and YAWCFG.bowSign~=-1 then return invalid('BOW_UNVERIFIED','Confirm fleet.bow_sign=1 or -1 on CORE; RAW is sign +1')end
-  if not finite(YAWCFG.yawOffset)then return invalid('BOW_UNVERIFIED','Invalid fleet.bow_offset')end
+  local dx,dy,dz=right.x-left.x,right.y-left.y,right.z-left.z
+  q.lr={x=dx,y=dy,z=dz};q.deltaY=dy
+  q.distance3d=math.sqrt(dx*dx+dy*dy+dz*dz);q.distanceError=q.distance3d-YAWCFG.mountDistance
+  q.horizontalBaseline=math.sqrt(dx*dx+dz*dz);q.baseline=q.horizontalBaseline
+  if math.abs(q.distanceError)>YAWCFG.mountTolerance then
+    return latchInvalid('YAW_MOUNT_DISTANCE_INVALID',string.format('12/13 3D distance %.2f; expected %.2f +/- %.2f',q.distance3d,YAWCFG.mountDistance,YAWCFG.mountTolerance))
+  end
+  if q.horizontalBaseline<YAWCFG.minHorizontal then
+    return latchInvalid('YAW_HORIZONTAL_PROJECTION_INVALID',string.format('12/13 horizontal projection %.2f below %.2f',q.horizontalBaseline,YAWCFG.minHorizontal))
+  end
+  if attitude and finite(attitude.tilt) and attitude.tilt>YAWCFG.maxTilt then
+    return latchInvalid('YAW_ATTITUDE_UNTRUSTED',string.format('Body tilt %.1f exceeds bow-up trust %.1f',attitude.tilt,YAWCFG.maxTilt))
+  end
+  if YAWCFG.bowSign~=1 and YAWCFG.bowSign~=-1 then return latchInvalid('BOW_CONFIG_INVALID','fleet.bow_sign must be +1 or -1 when explicitly set')end
+  if not finite(YAWCFG.yawOffset)then return latchInvalid('BOW_CONFIG_INVALID','Invalid fleet.bow_offset')end
+  q.rawYaw=wrapAngle(atanDeg(-dx,dz))
+  local pairNew=not track.candidateTimes
+  if track.candidateTimes then pairNew=left.time>track.candidateTimes[12] and right.time>track.candidateTimes[13] end
+  if pairNew then track.candidateTimes={[12]=left.time,[13]=right.time} end
+  if track.recovering~=false then
+    if pairNew then track.goodFrames=(track.goodFrames or 0)+1 end
+    q.recoveryFixes=track.goodFrames or 0
+    if q.recoveryFixes<YAWCFG.recoverFixes then
+      return recovering(string.format('BOW HOLD: fresh geometry %d/%d',q.recoveryFixes,YAWCFG.recoverFixes))
+    end
+    track.recovering=false;track.goodFrames=YAWCFG.recoverFixes
+  end
   local allNew=not track.times
-  if track.times then allNew=true;for id,g in pairs(points)do if not track.times[id] or g.time<=track.times[id]then allNew=false end end end
+  if track.times then allNew=left.time>track.times[12] and right.time>track.times[13] end
   local pose=track.pose
   if not allNew then
-    if not pose or time-pose.oldest>YAWCFG.maxAge*1000 then return invalid('YAW_GPS_DEGRADED','Waiting for complete new 12/13 frame')end
+    if not pose or time-pose.oldest>YAWCFG.maxAge*1000 then return latchInvalid('YAW_GPS_DEGRADED','Waiting for complete new 12/13 frame')end
     for k,v in pairs(pose)do q[k]=v end;q.pending=true;return finish()
   end
   q.yaw=wrapAngle(q.rawYaw+(YAWCFG.bowSign==-1 and 180 or 0)+YAWCFG.yawOffset)
@@ -584,11 +630,12 @@ local function yawPose(nodes,target,time,track,position)
     local dt=(q.time-pose.time)/1000
     if dt>0.05 and dt<=YAWCFG.maxAge then
       local rate=wrapAngle(q.yaw-pose.yaw)/dt
-      if math.abs(rate)>YAWCFG.maxRate then return invalid('YAW_GPS_DEGRADED','BOW GPS sample jump / rate invalid')end
+      if math.abs(rate)>YAWCFG.maxRate then return latchInvalid('YAW_GPS_DEGRADED','BOW GPS sample jump / rate invalid')end
       q.rate=pose.rateValid and pose.rate+(rate-pose.rate)*dt/(YAWCFG.rateFilter+dt) or rate;q.rateValid=true
     end
   end
-  track.times={[12]=left.time,[13]=right.time};q.reason='BOW from 12 LEFT -> 13 RIGHT; sign/offset confirmed'
+  track.times={[12]=left.time,[13]=right.time}
+  q.reason='BOW from 12 LEFT -> 13 RIGHT + body-up; '..(YAWCFG.bowSignSource or 'DEFAULT')
   track.pose={};for k,v in pairs(q)do track.pose[k]=v end
   return finish()
 end
@@ -617,7 +664,12 @@ local function directionDiagnostics(nav,rotation,time,track)
   elseif not turn then track.turnSince=nil;track.startError=nil;track.lastError=nil;track.growing=false end
   if track.growing then warnings[#warnings+1]='YAW_ERROR_GROWING'end
   if y.reasonCode=='YAW_BASELINE_INVALID'then warnings[#warnings+1]='YAW_BASELINE_INVALID'
+  elseif y.reasonCode=='YAW_MOUNT_DISTANCE_INVALID'then warnings[#warnings+1]='YAW_MOUNT_DISTANCE_INVALID'
+  elseif y.reasonCode=='YAW_HORIZONTAL_PROJECTION_INVALID'then warnings[#warnings+1]='YAW_HORIZONTAL_PROJECTION_INVALID'
+  elseif y.reasonCode=='YAW_ATTITUDE_UNTRUSTED'then warnings[#warnings+1]='YAW_ATTITUDE_UNTRUSTED'
+  elseif y.reasonCode=='YAW_RECOVERING'then warnings[#warnings+1]='YAW_RECOVERING'
   elseif y.reasonCode=='YAW_GPS_DEGRADED'then warnings[#warnings+1]='YAW_GPS_DEGRADED'
+  elseif y.reasonCode=='BOW_CONFIG_INVALID'then warnings[#warnings+1]='BOW_CONFIG_INVALID'
   elseif y.reasonCode=='BOW_UNVERIFIED'then warnings[#warnings+1]='BOW_UNVERIFIED'end
   return {warnings=warnings,bowCourseError=gap,course=course and m.course or nil,bow=y.valid and y.yaw or nil,
     target=y.targetYaw,forwardVector=mean,reverseFixes=track.reverseFixes or 0,reason=y.reason,time=time}
@@ -1346,7 +1398,7 @@ local function newBlackbox()
       if b.signatures['warn:'..warning]~=true then b.event('NAV',warning,nav.directionDiagnostics,false)end
       b.signatures['warn:'..warning]=true
     end
-    for _,warning in ipairs({'BOW_COURSE_OPPOSITE','YAW_ERROR_GROWING','FORWARD_COMMAND_REVERSE_MOTION','YAW_BASELINE_INVALID','YAW_GPS_DEGRADED','VECTOR_DIRECTION_SUSPECT','BOW_UNVERIFIED'})do
+    for _,warning in ipairs({'BOW_COURSE_OPPOSITE','YAW_ERROR_GROWING','FORWARD_COMMAND_REVERSE_MOTION','YAW_BASELINE_INVALID','YAW_MOUNT_DISTANCE_INVALID','YAW_HORIZONTAL_PROJECTION_INVALID','YAW_ATTITUDE_UNTRUSTED','YAW_RECOVERING','YAW_GPS_DEGRADED','VECTOR_DIRECTION_SUSPECT','BOW_CONFIG_INVALID','BOW_UNVERIFIED'})do
       local found=false;for _,v in ipairs(warnings)do found=found or v==warning end;if not found then b.signatures['warn:'..warning]=false end
     end
     if now-b.lastSnapshot>=c.interval*1000 then
@@ -1740,7 +1792,7 @@ local function controller()
       if navGPSState(gpsTrack,os.epoch('utc'))~='FIX' then return false,'Fresh GPS required' end
       local velocity=velocityValues(velocityPacket,os.epoch('utc'))
       if not finite(velocity.forward) or not finite(velocity.vertical) or not finite(velocity.lateral) then return false,'All three velocity sensors required' end
-      local pose=yawPose(health,nil,os.epoch('utc'),yawTrack)
+      local pose=yawPose(health,nil,os.epoch('utc'),yawTrack,nil,{tilt=tilt})
       if a=='DRIVE' and (not pose.valid or not finite(t.heading) or not finite(t.speed) or t.speed>50 or t.speed< -30) then return false,'Calibrated body YAW, absolute heading and signed speed -30..50 required' end
       if a=='HOVER_START' and (not finite(t.y) or math.abs(t.y)>30000000) then return false,'Valid HOVER Y required' end
       if a=='TEST_START' then
@@ -2019,7 +2071,7 @@ local function controller()
     local lastNavClock=os.clock()
     while true do
       local navDt=clamp(os.clock()-lastNavClock,0,0.2);lastNavClock=os.clock()
-      local pose=yawPose(health,nav.target,os.epoch('utc'),yawTrack,navFix);nav.yaw=pose
+      local pose=yawPose(health,nav.target,os.epoch('utc'),yawTrack,navFix,{tilt=tilt});nav.yaw=pose
       nav.velocity=velocityValues(velocityPacket,os.epoch('utc'))
       nav.limits={forward=VELCFG.forwardLimit,reverse=VELCFG.reverseLimit,cruise=VELCFG.cruiseSpeed}
       nav.gps=navGPSState(gpsTrack,os.epoch('utc'));nav.gpsAge=navFix and (os.epoch('utc')-navFix.time)/1000 or nil
