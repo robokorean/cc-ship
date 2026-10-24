@@ -95,7 +95,7 @@ local NAVCFG={courseVerified=true,yawSign=1,hoverMain=9,maxMain=10,maxVector=18,
   probeFixes=2,probeDistance=1,probeMaxSpeed=1.5,courseTimeout=5,
   alignDegrees=15,turnSeconds=3,brakeVector=6}
 local YAWCFG={bodyIds={12,13},bowSign=1,bowSignSource='DEFAULT_LEFT_RIGHT_UP',yawOffset=0,maxAge=2,maxSkew=0.25,
-  mountDistance=5,mountTolerance=1.25,minHorizontal=1.5,recoverFixes=3,maxTilt=70,
+  mountDistance=5,mountTolerance=0.75,minHorizontal=1.5,recoverFixes=3,maxTilt=70,
   maxRate=120,rateFilter=0.4,alignError=5,exitError=10,settleRate=2,alignSeconds=1,
   prediction=1,fineBand=15,maxVector=24,vectorRate=12,maxBoost=1,boostRise=0.5,boostFall=2,
   slipDegrees=60,slipSpeed=1,gpsLocateTimeout=2.5,gpsPollSeconds=0.5}
@@ -605,7 +605,26 @@ local function yawPose(nodes,target,time,track,position,attitude)
   end
   if YAWCFG.bowSign~=1 and YAWCFG.bowSign~=-1 then return latchInvalid('BOW_CONFIG_INVALID','fleet.bow_sign must be +1 or -1 when explicitly set')end
   if not finite(YAWCFG.yawOffset)then return latchInvalid('BOW_CONFIG_INVALID','Invalid fleet.bow_offset')end
-  q.rawYaw=wrapAngle(atanDeg(-dx,dz))
+  local g=attitude and attitude.gravity
+  if not validArray(g,3)then return latchInvalid('YAW_ATTITUDE_UNTRUSTED','Body-up gravity vector unavailable')end
+  local gl=math.sqrt(g[1]^2+g[2]^2+g[3]^2)
+  if gl<0.001 then return latchInvalid('YAW_ATTITUDE_UNTRUSTED','Body-up gravity vector invalid')end
+  local wf,wu,wr=-g[1]/gl,-g[2]/gl,-g[3]/gl
+  local rx,ry,rz=dx/q.distance3d,dy/q.distance3d,dz/q.distance3d
+  local px,py,pz=-ry*rx,1-ry*ry,-ry*rz
+  local pl=math.sqrt(px*px+py*py+pz*pz)
+  local localPlane=math.sqrt(wf*wf+wu*wu)
+  if pl<0.05 or localPlane<0.05 then return latchInvalid('YAW_ATTITUDE_UNTRUSTED','Body-up/right geometry cannot resolve bow')end
+  px,py,pz=px/pl,py/pl,pz/pl
+  local qx,qy,qz=py*rz-pz*ry,pz*rx-px*rz,px*ry-py*rx
+  local a,b=wf/localPlane,wu/localPlane
+  local fx,fy,fz=a*px+b*qx,a*py+b*qy,a*pz+b*qz
+  local ux,uy,uz=b*px-a*qx,b*py-a*qy,b*pz-a*qz
+  q.right={x=rx,y=ry,z=rz};q.forward={x=fx,y=fy,z=fz};q.bodyUp={x=ux,y=uy,z=uz}
+  q.gravityLocalUp={forward=wf,up=wu,right=wr};q.rightVertical=ry;q.gravityRightError=wr-ry
+  local fh=math.sqrt(fx*fx+fz*fz)
+  if fh<0.05 then return latchInvalid('YAW_ATTITUDE_UNTRUSTED','Bow horizontal projection too short')end
+  q.rawYaw=wrapAngle(atanDeg(fz,fx))
   local pairNew=not track.candidateTimes
   if track.candidateTimes then pairNew=left.time>track.candidateTimes[12] and right.time>track.candidateTimes[13] end
   if pairNew then track.candidateTimes={[12]=left.time,[13]=right.time} end
@@ -1792,7 +1811,7 @@ local function controller()
       if navGPSState(gpsTrack,os.epoch('utc'))~='FIX' then return false,'Fresh GPS required' end
       local velocity=velocityValues(velocityPacket,os.epoch('utc'))
       if not finite(velocity.forward) or not finite(velocity.vertical) or not finite(velocity.lateral) then return false,'All three velocity sensors required' end
-      local pose=yawPose(health,nil,os.epoch('utc'),yawTrack,nil,{tilt=tilt})
+      local pose=yawPose(health,nil,os.epoch('utc'),yawTrack,nil,{tilt=tilt,gravity=rawGravity})
       if a=='DRIVE' and (not pose.valid or not finite(t.heading) or not finite(t.speed) or t.speed>50 or t.speed< -30) then return false,'Calibrated body YAW, absolute heading and signed speed -30..50 required' end
       if a=='HOVER_START' and (not finite(t.y) or math.abs(t.y)>30000000) then return false,'Valid HOVER Y required' end
       if a=='TEST_START' then
@@ -2071,7 +2090,7 @@ local function controller()
     local lastNavClock=os.clock()
     while true do
       local navDt=clamp(os.clock()-lastNavClock,0,0.2);lastNavClock=os.clock()
-      local pose=yawPose(health,nav.target,os.epoch('utc'),yawTrack,navFix,{tilt=tilt});nav.yaw=pose
+      local pose=yawPose(health,nav.target,os.epoch('utc'),yawTrack,navFix,{tilt=tilt,gravity=rawGravity});nav.yaw=pose
       nav.velocity=velocityValues(velocityPacket,os.epoch('utc'))
       nav.limits={forward=VELCFG.forwardLimit,reverse=VELCFG.reverseLimit,cruise=VELCFG.cruiseSpeed}
       nav.gps=navGPSState(gpsTrack,os.epoch('utc'));nav.gpsAge=navFix and (os.epoch('utc')-navFix.time)/1000 or nil
