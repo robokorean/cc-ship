@@ -82,7 +82,7 @@ local function discoverFine(strict)
   return names
 end
 local ROLE=FLEET_ROLES or (args[1]~='test_api' and newRoles() or nil)
-local VERSION='2026.10.25-r20'
+local VERSION='2026.10.29-r21'
 local PAGE_COUNT=17
 local PAGE_NAMES={'PROPULSION','ANGLES','SENSORS','VECTOR STATUS','NODES','CRUISE / NAV','STATUS / PILOT','ADMIN','HOVER','MANUAL','TEST','WEAPONS','FACILITY','RADAR','LOG / ALERT','CONSOLES','ENGINEERING'}
 local CHANNEL=42110
@@ -594,6 +594,11 @@ local function draw(screen,model,now,page,radio,offset,navMode)
       put(2,19,'GPS '..gs..(age and string.format(' / AGE %.1fs',age) or ''),gs=='FIX' and '5' or '4')
       if age then put(2,20,string.format('X %.1f Y %.1f Z %.1f',g.x,g.y,g.z),gs=='FIX' and '0' or '8') end
       if h>=25 then
+        local demand=t and t.attitudeDemand or {};local pd=demand.pd or {}
+        local function value(v)return finite(v) and string.format('%+.3f',v) or '?'end
+        put(2,21,'PD R/P '..value(pd.roll)..' / '..value(pd.pitch)..' DZ '..tostring(t and t.deadzone or '?'),'8')
+        local ad=t and t.attitudeDiagnostics or {};local axes=ad.axes or {}
+        put(2,24,tostring((axes.pitch or {}).state or 'DEMAND NO DATA')..' HUNT '..tostring(ad.hunting or false),'8')
         local n=t and t.nodes and t.nodes[14];local ns,na=nodeState(n,now)
         put(2,22,'14 ROTATION '..ns..(na and string.format(' %.2fs',na) or ''),'8')
         if n and n.applied then

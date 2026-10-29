@@ -82,8 +82,8 @@ local function discoverFine(strict)
   if strict~=false then assert(#names>=minimum and #names<=64,'Fine detected '..#names..'; required '..minimum..'..64') end
   return names
 end
-local ROLE=FLEET_ROLES or (args[1]~='test_api' and newRoles() or nil)
-local VERSION='2026.10.25-r20'
+local ROLE=FLEET_ROLES or (args[1]~='test_api' and args[1]~='fine_inspect' and newRoles() or nil)
+local VERSION='2026.10.29-r21'
 local CFG={tick=0.05,finePower=1,nodeTimeout=1,commandTimeout=3,
   stopWriteTimeout=0.75,
   relayTimeout=0.5,assistDelay=3,assistRise=1,releaseRate=8,mainSlew=4,
@@ -397,7 +397,7 @@ local function mixStep(engine,r,p,baseLevel,dt,enabled,recovery,baseDemand)
     local desired=math.max(0,st.total+d)
     local v=quantize(st,math.min(desired,plans[z].ceiling),plans[z])
     st.main=v.main;st.sub=v.sub;st.fine=v.fine;st.total=v.total
-    v.phase=st.phase;v.assist=plans[z].assist;v.target=goals[z];v.signal=math.max(0,signed[z])
+    v.phase=st.phase;v.assist=plans[z].assist;v.target=goals[z];v.signal=math.max(0,signed[z]);v.signed=signed[z];v.targetCorrection=goals[z]-base
     v.correction=st.total-base;v.ceiling=plans[z].ceiling
     v.mainSuppressed=plans[z].suppressed;v.closing=plans[z].closing;v.mainHold=plans[z].hold
     out[z]=v;total=total+v.total
@@ -1404,6 +1404,7 @@ local function logClean(value,seen,depth)
   for k,v in pairs(value)do out[array and k or tostring(k)]=logClean(v,seen,depth+1)end
   seen[value]=nil;return out
 end
+local attitudeDiagnostics
 local function newBlackbox()
   local function option(name,default,lo,hi)local n=tonumber(setting('fleet.blackbox_'..name,default));return finite(n) and clamp(n,lo,hi) or default end
   local c={interval=option('interval',1,0.5,1),maxBytes=option('bytes',32768,8192,131072),eventBytes=option('event_bytes',65536,8192,131072),
@@ -1455,12 +1456,12 @@ local function newBlackbox()
     local nav=m.nav or {};local d=m.diagnostic or {};local nodes={};local control={}
     for _,id in ipairs({12,13,14,16,17,18,19})do local n=d.nodes and d.nodes[id]
       if n then nodes[tostring(id)]={actualId=n.actualId,role=n.role,version=n.version,ok=n.ok,state=n.state,error=n.error,
-        age=finite(n.time) and (now-n.time)/1000 or nil,fineCount=n.fineCount,appliedReported=n.applied,gps=n.gps,localSensors=n.localSensors}end
+        age=finite(n.time) and (now-n.time)/1000 or nil,fineCount=n.fineCount,appliedReported=n.applied,appliedSeq=n.appliedSeq,acceptedSeq=n.seq,requestedAtWrite=n.requestedAtWrite,fineAdapter=n.fineAdapter,gps=n.gps,localSensors=n.localSensors}end
     end
-    for _,z in ipairs({'LF','RF','LB','RB'})do local v=m.zones and m.zones[z];if v then control[z]={main=v.main,sub=v.sub,fine=v.fine,fineLevels=v.fineLevels,signal=v.signal,phase=v.phase,total=v.total,target=v.target}end end
+    for _,z in ipairs({'LF','RF','LB','RB'})do local v=m.zones and m.zones[z];if v then control[z]={main=v.main,sub=v.sub,fine=v.fine,fineLevels=v.fineLevels,signal=v.signal,signed=v.signed,correction=v.correction,targetCorrection=v.targetCorrection,ceiling=v.ceiling,phase=v.phase,total=v.total,target=v.target}end end
     return {state=m.state,armed=m.armed,error=m.error,coreVersion=m.version,coreAge=finite(m.time) and (now-m.time)/1000 or nil,
       fresh=fresh(m,1000),roles=m.roles,control={main=m.main,mainDemand=m.mainDemand,zones=control,vector=m.rotation,estimate=m.thrust},
-      attitude={angles=m.angles,recovery=m.recovery,deadzone=m.deadzone,motion=m.attitudeMotion},nav={active=nav.active,mode=nav.commandMode,stage=nav.stage,state=nav.state,reason=nav.reason,
+      attitude={angles=m.angles,recovery=m.recovery,deadzone=m.deadzone,motion=m.attitudeMotion,demand=m.attitudeDemand,diagnostics=b.attitude},nav={active=nav.active,mode=nav.commandMode,stage=nav.stage,state=nav.state,reason=nav.reason,
         gps=nav.gps,fix=nav.fix,target=nav.target,bow=nav.yaw,actual=nav.actual,course=nav.course,courseTrusted=nav.courseTrusted,courseError=nav.courseError,
         courseContinuing=nav.courseContinuing,courseAge=nav.courseAge,turnInPlace=nav.turnInPlace,turnSide=nav.turnSide,targetForward=nav.targetForward,turnAngle=nav.turnAngle,turnBoost=nav.turnBoost,yawSign=nav.yawSign,directionLock=nav.directionLock,
         velocity=nav.velocity,landing=nav.landing,landingPhase=nav.landingPhase,targetVy=nav.targetVy,diagnostics=nav.directionDiagnostics},
@@ -1470,6 +1471,12 @@ local function newBlackbox()
   function b.observe(m)
     if not c.enabled or type(m)~='table'then return end
     b.lastStatus=m;local now=os.epoch('utc');local nav=m.nav or {};local d=m.diagnostic or {}
+    b.attitudeTrack=b.attitudeTrack or {};b.attitude=attitudeDiagnostics(m,b.attitudeTrack,now)
+    for _,axis in ipairs({'roll','pitch'})do local v=b.attitude.axes[axis]
+      transition('attitude:'..axis,v.state,'ATTITUDE','AXIS_STATE',{axis=axis,state=v.state,detail=v,seq=m.seq})
+    end
+    transition('attitude:hunting',tostring(b.attitude.hunting),'ATTITUDE','HUNTING_STATE',{suspected=b.attitude.hunting,axes=b.attitude.axes})
+    transition('attitude:saturation',tostring(b.attitude.saturation),'ATTITUDE','SATURATION_STATE',{suspected=b.attitude.saturation,seconds=b.attitude.saturationSeconds})
     local details={state=m.state,armed=m.armed,error=m.error,mode=nav.commandMode,stage=nav.stage,reason=nav.reason}
     transition('session',m.session,'SYSTEM','CORE_SESSION',{session=m.session,version=m.version})
     transition('state',tostring(m.state)..':'..tostring(m.armed)..':'..tostring(m.error),'SYSTEM','CONTROL_STATE',details,m.state=='FAULT' or m.state=='STOPPED')
@@ -1565,7 +1572,169 @@ local function newBlackbox()
   end
   return b
 end
-if args[1]=='test_api' then return {attitudeMotionStep=attitudeMotionStep,logClean=logClean,newBlackbox=newBlackbox,directionDiagnostics=directionDiagnostics,rolesFactory=newRoles,discoverFine=discoverFine,modecfg=MODECFG,verticalHold=verticalHold,manualStep=manualStep,hoverStep=hoverStep,testStep=testStep,finishTest=finishTest,testRecords=function(nav)return TEST_RECORDS[nav]end,cruisecfg=CRUISECFG,directionLock=directionLock,resetCruise=resetCruise,brakingModel=brakingModel,velocityValues=velocityValues,applyVelocity=applyVelocity,speedGuard=speedGuard,cruiseCommand=cruiseCommand,velcfg=VELCFG,geometry=geometry,zones=zones,allocate=allocate,rotationValues=rotationValues,cfg=CFG,navcfg=NAVCFG,axisDemand=axisDemand,navMetrics=navMetrics,newMixer=newMixer,mixStep=mixStep,estimate=estimate,balance=balance,thrust=THRUST,recoveryState=recoveryState,recoverycfg=RECOVERY,newRecovery=newRecovery,recoveryStep=recoveryStep,recoveryDemand=recoveryDemand,navStep=navStep,ingestGPS=ingestGPS,navGPSState=navGPSState,suspendGPS=suspendGPS,navHold=navHold,yawcfg=YAWCFG,landcfg=LANDCFG,yawPose=yawPose,yawCommand=yawCommand,wrapAngle=wrapAngle,sampleGPS=sampleGPS,landingProfile=landingProfile,landingStep=landingStep,landingStage=landingStage} end
+local function fineInventory(names)
+  local out={}
+  for index,name in ipairs(names)do
+    if index>64 then break end
+    local ok,methods=pcall(peripheral.getMethods,name)
+    local kinds={};if peripheral.getType then local r={pcall(peripheral.getType,name)};if r[1]then for i=2,#r do kinds[#kinds+1]=tostring(r[i])end end end
+    local list={};if ok and type(methods)=='table'then for _,m in ipairs(methods)do if type(m)=='string' and #list<64 then list[#list+1]=m:sub(1,80)end end;table.sort(list)end
+    out[#out+1]={name=name,types=kinds,methods=list,methodScanOK=ok and type(methods)=='table',physicalResolution='UNVERIFIED'}
+  end
+  return out
+end
+local function newFineAdapter(names,logical,actual,profile)
+  local inventory=fineInventory(names)
+  local a={devices={},inventory=inventory,trial=false,source='LEGACY_NORMALIZED',physicalResolution='UNVERIFIED'}
+  local selected=type(profile)=='table' and profile.enabled==true and profile.pilotComputer==actual
+  local specs={}
+  if selected then
+    local ok,why=pcall(function()
+      assert(profile.confirmed==true and profile.scope=='SINGLE_ZONE_TEST','Confirm SINGLE_ZONE_TEST on one actual computer')
+      assert(profile.fallbackCompatible==true,'Verify legacy fallback overrides the same absolute actuator output')
+      assert(type(profile.devices)=='table','Missing per-device runtime method configuration')
+      local rise=profile.risePerSecond or CFG.fineRise;local fall=profile.fallPerSecond or CFG.fineFall
+      assert(finite(rise) and rise>0 and rise<=CFG.fineRise,'Invalid trial rise rate')
+      assert(finite(fall) and fall>=CFG.fineFall and fall<=20,'Trial fall rate must preserve prompt damping release')
+      a.rise=rise;a.fall=fall;a.epsilon=profile.writeEpsilon or 0.000001
+      assert(finite(a.epsilon) and a.epsilon>0 and a.epsilon<=0.001,'Invalid normalized write epsilon')
+      for i,entry in ipairs(inventory)do
+        local d=profile.devices[entry.name];assert(type(d)=='table','Missing trial config for '..entry.name)
+        local methods={};for _,m in ipairs(entry.methods)do methods[m]=true end
+        assert(type(d.method)=='string' and methods[d.method],'Configured write method absent at runtime: '..entry.name)
+        assert(methods.setPowerNormalized,'Legacy fallback unavailable: '..entry.name)
+        assert(d.absolute==true and finite(d.zero) and finite(d.full) and d.full>d.zero
+          and math.abs(d.zero)<=1000000 and math.abs(d.full)<=1000000,'Confirm absolute output units/zero/full: '..entry.name)
+        if d.readback then
+          local r=d.readback;assert(type(r)=='table' and r.readOnlyConfirmed==true and type(r.method)=='string' and methods[r.method]
+            and finite(r.zero) and finite(r.full) and r.full>r.zero,'Verify read-only getter and units: '..entry.name)
+        end
+        specs[i]={method=d.method,zero=d.zero,full=d.full,readback=d.readback}
+      end
+    end)
+    if ok then a.trial=true;a.source='PROPULSION_API' else a.source='FALLBACK';a.warning=tostring(why)end
+  elseif type(profile)=='table' and profile.enabled==true then a.warning='Trial belongs to a different actual computer; legacy retained' end
+  for i,name in ipairs(names)do a.devices[i]={name=name,source=a.source,requested=0,accepted=0,acceptedKnown=false,physicalResolution='UNVERIFIED',spec=specs[i]}end
+  local function call(name,method,value)
+    local ok,result=pcall(peripheral.call,name,method,value)
+    if not ok or result==false then return false,tostring(result)end
+    return true
+  end
+  local function fallback(d,value,reason)
+    d.source='FALLBACK';d.error=tostring(reason):sub(1,180);d.failed=true;a.warning=d.error
+    if d.spec then d.directZeroOK=call(d.name,d.spec.method,d.spec.zero)end
+    local ok,why=call(d.name,'setPowerNormalized',0)
+    if not ok then return false,'Legacy zero failed: '..tostring(why)end
+    d.accepted=0;d.acceptedKnown=true
+    if value~=0 then ok,why=call(d.name,'setPowerNormalized',value)end
+    if ok then d.accepted=value;d.time=os.epoch('utc')end
+    return ok,why
+  end
+  function a.write(i,value,force,dt,immediate)
+    local d=assert(a.devices[i],'Unknown Fine actuator')
+    assert(finite(value) and value>=0 and value<=1,'Invalid normalized Fine request')
+    d.requested=value
+    if not a.trial then
+      if force or not d.acceptedKnown or d.accepted~=value then
+        local ok,why=call(d.name,'setPowerNormalized',value)
+        if not ok then return false,why end
+        d.accepted=value;d.acceptedKnown=true;d.time=os.epoch('utc')
+      end
+      return true,d.accepted
+    end
+    local desired=immediate and 0 or d.accepted+clamp(value-d.accepted,-a.fall*clamp(dt,0,0.2),a.rise*clamp(dt,0,0.2))
+    if d.failed then
+      if force or immediate or math.abs(desired-d.accepted)>=a.epsilon then
+        local ok,why=call(d.name,'setPowerNormalized',desired);if not ok then return false,why end
+        d.accepted=desired;d.acceptedKnown=true;d.time=os.epoch('utc')
+      end
+      return true,d.accepted
+    end
+    if not d.acceptedKnown then
+      local ok,why=call(d.name,d.spec.method,d.spec.zero)
+      if not ok then local good,problem=fallback(d,desired,why);return good,good and d.accepted or problem end
+      d.accepted=0;d.acceptedKnown=true
+    end
+    if force or immediate or math.abs(desired-d.accepted)>=a.epsilon then
+      local raw=d.spec.zero+desired*(d.spec.full-d.spec.zero)
+      local ok,why=call(d.name,d.spec.method,raw)
+      if not ok then local good,problem=fallback(d,desired,why);return good,good and d.accepted or problem end
+      d.accepted=desired;d.time=os.epoch('utc')
+    end
+    return true,d.accepted
+  end
+  function a.readback()
+    for _,d in ipairs(a.devices)do
+      local r=d.spec and d.spec.readback
+      if a.trial and not d.failed and r then
+        local ok,v=pcall(peripheral.call,d.name,r.method)
+        local n=ok and finite(v) and (v-r.zero)/(r.full-r.zero) or nil
+        if n and n>=-0.000001 and n<=1.000001 then d.reported=clamp(n,0,1);d.reportedTime=os.epoch('utc');d.readbackError=nil
+        else d.reported=nil;d.reportedTime=nil;d.readbackError=ok and 'Invalid peripheral readback' or tostring(v):sub(1,180)end
+      else d.reported=nil;d.reportedTime=nil end
+    end
+  end
+  function a.status()
+    local out={trial=a.trial,source=a.source,warning=a.warning,pilotComputer=selected and actual or nil,logical=logical,
+      risePerSecond=a.trial and a.rise or nil,fallPerSecond=a.trial and a.fall or nil,physicalResolution='UNVERIFIED',devices={}}
+    local sources={}
+    for i,d in ipairs(a.devices)do
+      sources[d.source]=true
+      out.devices[i]={name=d.name,source=d.source,method=a.trial and not d.failed and d.spec and d.spec.method or 'setPowerNormalized',configuredMethod=d.spec and d.spec.method,requested=d.requested,
+        accepted=d.accepted,acceptedKnown=d.acceptedKnown,time=d.time,error=d.error,directZeroOK=d.directZeroOK,
+        writeZero=a.trial and not d.failed and d.spec and d.spec.zero or nil,writeFull=a.trial and not d.failed and d.spec and d.spec.full or nil,
+        reported=d.reported,reportedTime=d.reportedTime,readbackError=d.readbackError,
+        reportKind=d.reported~=nil and 'PERIPHERAL_REPORTED / NOT MEASURED THRUST' or nil}
+    end
+    local count=0;local source;for v in pairs(sources)do count=count+1;source=v end
+    out.source=count>1 and 'MIXED / FALLBACK' or source or out.source
+    return out
+  end
+  return a
+end
+attitudeDiagnostics=function(m,s,now)
+  s=s or {};local a=m.angles or {};local r=m.recovery or {};local d=m.attitudeDemand or {}
+  local out={axes={},hunting=false,saturation=false,time=now,physicalThrust='NOT MEASURED'}
+  local freshSensor=finite(a.time) and now-a.time>=-100 and now-a.time<=500 and not (m.diagnostic and m.diagnostic.sensorOK==false)
+  local enabled=m.armed==true and freshSensor and not r.active and finite(m.seq) and d.seq==m.seq
+    and type(d.pd)=='table' and type(d.command)=='table' and finite(d.pd.roll) and finite(d.pd.pitch)
+    and finite(d.command.roll) and finite(d.command.pitch)
+  for _,name in ipairs({'roll','pitch'})do
+    local e=a[name];local rate=name=='roll' and r.rateR or r.rateP;local demand=d.command and d.command[name]
+    local raw=d.pd and d.pd[name];local dz=m.deadzone or 1;local t=s[name] or {};s[name]=t
+    if t.last and (now-t.last>1500 or now<t.last)then t.since=nil;t.crossings={};t.sign=nil end;t.last=now
+    local still=enabled and finite(e) and math.abs(e)>dz and finite(rate) and math.abs(rate)<=0.15
+    if still then t.since=t.since or now else t.since=nil end
+    local sign=finite(demand) and math.abs(demand)>0.1 and (demand>0 and 1 or -1) or nil
+    t.crossings=t.crossings or {}
+    if enabled and sign and t.sign and sign~=t.sign then t.crossings[#t.crossings+1]=now end
+    if sign and enabled then t.sign=sign end
+    if not enabled then t.crossings={};t.sign=nil end
+    while #t.crossings>0 and now-t.crossings[1]>8000 do table.remove(t.crossings,1)end
+    local state=not m.armed and 'DISARMED' or not freshSensor and 'SENSOR_STALE' or r.active and 'RECOVERY' or not enabled and 'DEMAND_UNAVAILABLE' or 'ACTIVE'
+    if enabled and finite(e) and math.abs(e)>dz and finite(rate) and e*rate<0 and finite(raw) and math.abs(raw)<0.05 then state='RATE_DAMPED' end
+    local seconds=t.since and (now-t.since)/1000 or 0
+    if seconds>=3 then state=finite(raw) and math.abs(raw)<0.05 and 'STEADY_ERROR / CHECK_DEMAND' or 'STEADY_ERROR / DEMAND_PRESENT' end
+    out.axes[name]={state=state,error=e,rate=rate,deadzone=dz,pd=raw,command=demand,steadySeconds=seconds,crossings=#t.crossings}
+    out.hunting=out.hunting or #t.crossings>=4
+  end
+  local thrust=m.thrust or {};local saturated=(thrust.saturated or 0)>0 or thrust.headroomLimited==true
+  for _,z in ipairs(ZONES)do local v=m.zones and m.zones[z]
+    if v and finite(v.total) and finite(v.ceiling) and v.total>=v.ceiling-0.01 and math.abs(v.signed or 0)>0.1 then saturated=true end
+  end
+  if enabled and saturated then s.saturationSince=s.saturationSince or now else s.saturationSince=nil end
+  out.saturation=s.saturationSince~=nil and now-s.saturationSince>=5000
+  out.saturationSeconds=s.saturationSince and (now-s.saturationSince)/1000 or 0
+  return out
+end
+
+if args[1]=='test_api' then return {fineInventory=fineInventory,newFineAdapter=newFineAdapter,attitudeDiagnostics=attitudeDiagnostics,attitudeMotionStep=attitudeMotionStep,logClean=logClean,newBlackbox=newBlackbox,directionDiagnostics=directionDiagnostics,rolesFactory=newRoles,discoverFine=discoverFine,modecfg=MODECFG,verticalHold=verticalHold,manualStep=manualStep,hoverStep=hoverStep,testStep=testStep,finishTest=finishTest,testRecords=function(nav)return TEST_RECORDS[nav]end,cruisecfg=CRUISECFG,directionLock=directionLock,resetCruise=resetCruise,brakingModel=brakingModel,velocityValues=velocityValues,applyVelocity=applyVelocity,speedGuard=speedGuard,cruiseCommand=cruiseCommand,velcfg=VELCFG,geometry=geometry,zones=zones,allocate=allocate,rotationValues=rotationValues,cfg=CFG,navcfg=NAVCFG,axisDemand=axisDemand,navMetrics=navMetrics,newMixer=newMixer,mixStep=mixStep,estimate=estimate,balance=balance,thrust=THRUST,recoveryState=recoveryState,recoverycfg=RECOVERY,newRecovery=newRecovery,recoveryStep=recoveryStep,recoveryDemand=recoveryDemand,navStep=navStep,ingestGPS=ingestGPS,navGPSState=navGPSState,suspendGPS=suspendGPS,navHold=navHold,yawcfg=YAWCFG,landcfg=LANDCFG,yawPose=yawPose,yawCommand=yawCommand,wrapAngle=wrapAngle,sampleGPS=sampleGPS,landingProfile=landingProfile,landingStep=landingStep,landingStage=landingStage} end
+if args[1]=='fine_inspect' then
+  local result={computer=os.getComputerID(),time=os.epoch('utc'),version=VERSION,devices=fineInventory(peripheral.getNames()),actuatorWrites=false}
+  print(textutils.serialize(result))
+  local h,why=fs.open('fleet_fine_inventory.txt','w');assert(h,why);h.write(textutils.serialize(result));h.close()
+  return
+end
 local function managedStop()
   while true do
     local _,id=os.pullEvent('fleet_managed_stop')
@@ -1609,6 +1778,7 @@ local function node(id)
   for k,v in pairs(zero) do target[k]=v end
   local session,lastSeq,lastRx=nil,-1,-math.huge
   local errorText,healthy=nil,false
+  local fineAdapter,appliedSeq,requestedAtWrite,adapterLast,adapterObject
   local force=true
   local nodeGPS={id=id,ok=false}
   local localSensors={}
@@ -1648,7 +1818,9 @@ local function node(id)
     target={};for k,v in pairs(zero) do target[k]=v end
     force=true
   end
-  local function write(values)
+  local function write(values,dt,immediate)
+    local wroteOK=true
+    if FINE[id] and not fineAdapter then fineAdapter=newFineAdapter(names,id,os.getComputerID(),setting('fleet.fine_adapter',nil))end
     if id==14 then
       for _,pair in ipairs({{'left','right'},{'top','bottom'}}) do
         local a,b=pair[1],pair[2]
@@ -1661,31 +1833,34 @@ local function node(id)
             if values[b]>0 then redstone.setAnalogOutput(b,values[b]);applied[b]=values[b] end
           end
         end)
-        if not ok then errorText=tostring(err);healthy=false end
+        if not ok then errorText=tostring(err);healthy=false;wroteOK=false end
       end
-      force=false;return
+      force=false;return wroteOK
     end
     local tasks={}
     for key,value in pairs(values) do
-      if force or applied[key]~=value then
+      if FINE[id] or force or applied[key]~=value then
         local k,v=key,value
         tasks[#tasks+1]=function()
           local ok,err
-          if FINE[id] then ok,err=pcall(peripheral.call,names[k],'setPowerNormalized',v)
+          if FINE[id] then
+            local accepted;ok,accepted=fineAdapter.write(k,v,force,dt or CFG.tick,immediate==true)
+            if ok then v=accepted else err=accepted end
           else ok,err=pcall(redstone.setAnalogOutput,k,v) end
-          if ok then applied[k]=v else errorText=tostring(err);healthy=false end
+          if ok then applied[k]=v else errorText=tostring(err);healthy=false;wroteOK=false end
         end
       end
     end
     if #tasks>0 then parallel.waitForAll(table.unpack(tasks)) end
-    force=false
+    force=false;return wroteOK
   end
   local function validate()
     errorText=nil;healthy=true;applied={};force=true
     if FINE[id] then
+      fineAdapter=newFineAdapter(names,id,os.getComputerID(),setting('fleet.fine_adapter',nil))
       for _,name in ipairs(names) do
         if not peripheral.hasType(name,'ion_thruster') then errorText='Missing '..name;healthy=false;break end
-        local methods=peripheral.getMethods(name) or {}
+        local scanned,methods=pcall(peripheral.getMethods,name);methods=scanned and type(methods)=='table' and methods or {}
         local found=false
         for _,m in ipairs(methods) do if m=='setPowerNormalized' then found=true end end
         if not found then errorText='No setPowerNormalized: '..name;healthy=false;break end
@@ -1701,11 +1876,13 @@ local function node(id)
             local ok,list=pcall(discoverFine)
             if ok then
               local changed=#list~=#names;for i,n in ipairs(list)do changed=changed or names[i]~=n end
-              if changed then write(zero) end
+              if changed then write(zero,CFG.tick,true);fineAdapter=nil end
               names=list;zero={};for i=1,#names do zero[i]=0 end
             else healthy=false;errorText=tostring(list);reset() end
           end
-          reset();session=m.session;lastSeq=-1;lastRx=os.clock();validate()
+          reset();local zeroOK=write(zero,CFG.tick,true);local zeroError=errorText
+          session=m.session;lastSeq=-1;lastRx=os.clock();validate()
+          if not zeroOK then healthy=false;errorText=zeroError or 'Prior adapter zero failed' end
           if FINE[id] then local ok,why=pcall(discoverFine);if not ok then healthy=false;errorText=tostring(why) end end
         elseif m.kind=='STOP' then reset();lastRx=-math.huge
         elseif m.kind=='OUTPUT' and m.session==session and finite(m.seq) and m.seq>lastSeq then
@@ -1727,13 +1904,17 @@ local function node(id)
     end
   end
   local function writer()
-    write(zero);validate()
+    write(zero,CFG.tick,true);validate()
+    local lastWrite=os.clock()
     while true do
+      local now=os.clock();local dt=clamp(now-lastWrite,0,0.2);lastWrite=now
       local conflict=ROLE.conflict();if conflict then healthy=false;errorText=conflict end
-      if os.clock()-lastRx>CFG.nodeTimeout or not healthy then reset() end
-      local snapshot={};for k,v in pairs(target) do snapshot[k]=v end
-      write(snapshot)
-      if not healthy then reset();write(zero) end
+      if now-lastRx>CFG.nodeTimeout or not healthy then reset() end
+      local snapshot={};local allZero=true;for k,v in pairs(target) do snapshot[k]=v;allZero=allZero and v==0 end
+      local snapshotSeq=lastSeq
+      write(snapshot,dt,force and allZero)
+      if healthy then appliedSeq=snapshotSeq;requestedAtWrite=snapshot end
+      if not healthy then reset();write(zero,dt,true) end
       sleep(CFG.tick)
     end
   end
@@ -1756,8 +1937,13 @@ local function node(id)
       end
       local event=tostring(healthy)..':'..tostring(errorText)..':'..tostring(#names)
       if event~=lastEvent then lastEvent=event;emitLog(healthy and 'NODE' or 'SAFETY',healthy and 'NODE_READY' or 'NODE_FAULT',{id=id,error=errorText,fineCount=FINE[id] and #names,appliedReported=applied})end
+      if fineAdapter then
+        local signature=fineAdapter.status().source..':'..tostring(fineAdapter.warning)
+        if signature~=adapterLast or fineAdapter~=adapterObject then adapterLast=signature;adapterObject=fineAdapter;emitLog('NODE','FINE_ADAPTER',{adapter=fineAdapter.status(),inventory=fineAdapter.inventory})end
+      end
       runtime(healthy and 'OUTPUT NODE' or 'FAULT',active,errorText)
       send(10,{kind='NODE',session=session,id=id,ok=healthy,error=errorText,
+        fineAdapter=fineAdapter and fineAdapter.status(),appliedSeq=appliedSeq,requestedAtWrite=requestedAtWrite,
         localSensors=FINE[id] and localSensors or nil,fineCount=FINE[id] and #names or nil,fineNames=FINE[id] and names or nil,role=ROLE.role,actualId=ROLE.actual,seq=lastSeq,applied=applied,gps=not FINE[id] and nodeGPS or nil,version=VERSION,state=healthy and
           (os.clock()-lastRx<=CFG.nodeTimeout and 'RECEIVING' or 'WAITING') or 'FAULT'})
       term.clear();term.setCursorPos(1,1)
@@ -1771,9 +1957,9 @@ local function node(id)
   local function keyboard()
     while true do local _,k=os.pullEvent('key');if k==keys.q then return end end
   end
-  local ok,err=pcall(function() parallel.waitForAny(receiver,writer,report,keyboard,managedStop,gpsReader,roleWorker,localSensorReader,logSender) end)
+  local ok,err=pcall(function() parallel.waitForAny(receiver,writer,report,keyboard,managedStop,gpsReader,roleWorker,localSensorReader,logSender,fineReader) end)
   force=true
-  parallel.waitForAny(function()pcall(write,zero)end,function()sleep(CFG.stopWriteTimeout)end)
+  parallel.waitForAny(function()pcall(write,zero,CFG.tick,true)end,function()sleep(CFG.stopWriteTimeout)end)
   stopWire()
   if not ok then
     if FLEET_RUN then os.queueEvent('fleet_run_error',os.getComputerID(),tostring(err),FLEET_RUN) end
@@ -1806,6 +1992,7 @@ local function controller()
   local rotation={enabled=false,left=0,right=0}
   local mixer=newMixer({LF=0,RF=0,LB=0,RB=0})
   local recovery=newRecovery()
+  local attitudeDemand={}
   local attitudeMotion={moving=false,mode='HOVER',deadzone=CFG.hoverDeadzone}
   local thrustState={total=0}
   local zoneState={}
@@ -2123,6 +2310,7 @@ local function controller()
       local _,motionChanged=attitudeMotionStep(attitudeMotion,velocityValues(velocityPacket,os.epoch('utc')),nav.actual,nav.gps,rotation,armed,os.epoch('utc'))
       if motionChanged then emitLog('ATTITUDE','DEADZONE_MODE',{mode=attitudeMotion.mode,deadzone=attitudeMotion.deadzone,speed=attitudeMotion.speed,source=attitudeMotion.source})end
       local cr,cp=axisDemand(roll,rateR),axisDemand(pitch,rateP)
+      local pdR,pdP=cr,cp
       if armed and not faultText then
         recoveryStep(recovery,roll,pitch,rateR,rateP,tilt,math.min(dt,0.2),now)
         if recovery.active then
@@ -2135,6 +2323,9 @@ local function controller()
           end
         end
       end
+      attitudeDemand={time=os.epoch('utc'),seq=sequence,pd={roll=pdR,pitch=pdP},command={roll=cr,pitch=cp},
+        deadzone=CFG.deadzone,motionMode=attitudeMotion.mode,sensorTime=sensorTime,armed=armed,recovery=recovery.active,
+        predicted={roll=roll+rateR*0.5,pitch=pitch+rateP*0.5}}
       output(cr,cp,math.min(dt,0.2))
       repeat
         local _,timer=os.pullEvent('timer')
@@ -2152,7 +2343,7 @@ local function controller()
         {token=FLEET_MAINTENANCE.token,zero=maintenanceSince~=nil,readySince=maintenanceSince,frames=maintenanceFrames,missingSince=maintenanceMissing} or nil)
       send(11,{kind='STATUS',session=session,armed=armed,state=state,error=faultText,
         inputs=inputs,relayAge=os.clock()-relaySeen,interval=interval,main=baseMain,zones=zoneState,
-        seq=sequence,version=VERSION,roles=ROLE.snapshot(),recovery={active=recovery.active,reason=recovery.reason,stable=recovery.stable,rateR=rateR,rateP=rateP},thrust=thrustState,mainCommand=math.floor(baseDemand()+1e-8),mainDemand=baseDemand(),nav=nav,deadzone=CFG.deadzone,attitudeMotion=attitudeMotion,rotation={enabled=rotation.enabled,left=rotation.enabled and (rotation.appliedLeft or rotation.left) or 0,
+        seq=sequence,version=VERSION,roles=ROLE.snapshot(),recovery={active=recovery.active,reason=recovery.reason,stable=recovery.stable,rateR=rateR,rateP=rateP},thrust=thrustState,mainCommand=math.floor(baseDemand()+1e-8),mainDemand=baseDemand(),nav=nav,attitudeDemand=attitudeDemand,deadzone=CFG.deadzone,attitudeMotion=attitudeMotion,rotation={enabled=rotation.enabled,left=rotation.enabled and (rotation.appliedLeft or rotation.left) or 0,
           right=rotation.enabled and (rotation.appliedRight or rotation.right) or 0,outputs=rotationValues(rotation.enabled and (rotation.appliedLeft or rotation.left) or 0,rotation.enabled and (rotation.appliedRight or rotation.right) or 0)},angles=sensorTime and {roll=roll,pitch=pitch,time=sensorTime},
         diagnostic={sensor=CFG.sensor,sensorOK=sensorOK,sensorError=sensorError,present=sensorPresent,
           angleOK=angleOK,angleError=angleError,gravity=rawGravity,rawAngles=rawAngles,angleTime=angleTime,
@@ -2218,6 +2409,10 @@ local function controller()
       if angleOK then rawAngles=a;angleTime=os.epoch('utc') end
       sleep(0.25)
     end
+  end
+  local function fineReader()
+    if not FINE[id]then while true do sleep(60)end end
+    while true do if fineAdapter then fineAdapter.readback()end;sleep(0.5)end
   end
   local function keyboard()
     while true do
@@ -2419,6 +2614,11 @@ local function ui()
     if d.sensorError then out[#out+1]=tostring(d.sensorError):sub(1,160) end
     if d.sensorTime then out[#out+1]=string.format('Last gravity age: %.2fs',(os.epoch('utc')-d.sensorTime)/1000) end
     local function add(v) out[#out+1]=v end
+    local demand=status.attitudeDemand or {};local pd=demand.pd or {};local cmd=demand.command or {}
+    add(string.format('PD R/P %s / %s -> CMD %s / %s',tostring(pd.roll or '?'),tostring(pd.pitch or '?'),tostring(cmd.roll or '?'),tostring(cmd.pitch or '?')):sub(1,180))
+    local ad=blackbox.attitude or {};local axes=ad.axes or {}
+    add('Attitude '..tostring((axes.roll or {}).state or '?')..' / '..tostring((axes.pitch or {}).state or '?'))
+    add('Hunting '..tostring(ad.hunting)..' saturation '..tostring(ad.saturation)..' / no attitude Integral')
     if d.gravity then add(string.format('Raw gravity: %.3f %.3f %.3f',table.unpack(d.gravity))) end
     if d.rawAngles then
       add(string.format('Raw angles: %.2f %.2f (age %.2fs)',d.rawAngles[1],d.rawAngles[2],
@@ -2439,7 +2639,7 @@ local function ui()
     local function values(v)
       if type(v)~='table' then return '?' end
       local text={}
-      for i=1,math.min(8,#v) do text[i]=finite(v[i]) and string.format('%.0f',v[i]*100) or '?' end
+      for i=1,math.min(8,#v) do text[i]=finite(v[i]) and string.format('%.3f',v[i]*100) or '?' end
       return table.concat(text,' ')..' %'
     end
     local nodes=d.nodes or {}
@@ -2459,6 +2659,9 @@ local function ui()
       add(string.format(' M %s -> %s / S %s -> %s',cmd and cmd.main or '?',mainValue,cmd and cmd.sub or '?',subValue))
       add(' Fine cmd: '..values(cmd and cmd.fineLevels))
       add(' Fine set: '..values(recent(fineNode) and fineNode.applied or nil))
+      local adapter=fineNode and fineNode.fineAdapter or {}
+      add(' Fine '..tostring(adapter.source or 'LEGACY / UNKNOWN')..' seq '..tostring(status.seq)..'/'..tostring(fineNode and fineNode.appliedSeq or '?')..' / unmeasured')
+  
     end
     add('Tcmd = COMMAND-EQUIVALENT; NOT measured thrust')
     local t=status.thrust
@@ -2470,7 +2673,7 @@ local function ui()
     for _,z in ipairs({'LF','RF','LB','RB'}) do
       local v=status.zones[z]
       if v then
-        add(string.format('%s %s T %.3f -> %.3f',z,v.phase or '?',v.total or 0,v.target or 0))
+        add(string.format('%s %s T %.3f -> %.3f signed %.3f corr %.3f',z,v.phase or '?',v.total or 0,v.target or 0,v.signed or 0,v.correction or 0))
         add(string.format(' Assist %s / rise blocked %s / close %.2f deg/s',tostring(v.assist==true),tostring(v.mainSuppressed==true),v.closing or 0))
         add(string.format(' Saturation hold %.2fs / %.2fs',v.mainHold or 0,THRUST.mainDelay))
       end
@@ -2498,12 +2701,13 @@ local function ui()
     if logs.error then add('LOG WARNING '..logs.error:sub(1,120))end
     add('Reports = successful writes, NOT measured thrust')
     add('Node reports may lag commands by 0.25s+')
+    if #out>80 then local capped={};for i=1,75 do capped[i]=out[i]end;capped[76]='More detail in blackbox';for i=77,80 do capped[i]=out[#out-80+i]end;return capped end
     return out
   end
   local function nodeReports()
     local reports={}
     for id,n in pairs((status.diagnostic or {}).nodes or {}) do
-      reports[id]={time=n.time,ok=n.ok,state=n.state,error=n.error,version=n.version,applied=n.applied,gps=n.gps,localSensors=n.localSensors,fineCount=n.fineCount,fineNames=n.fineNames,role=n.role,actualId=n.actualId}
+      reports[id]={time=n.time,ok=n.ok,state=n.state,error=n.error,version=n.version,applied=n.applied,fineAdapter=n.fineAdapter,appliedSeq=n.appliedSeq,acceptedSeq=n.seq,requestedAtWrite=n.requestedAtWrite,gps=n.gps,localSensors=n.localSensors,fineCount=n.fineCount,fineNames=n.fineNames,role=n.role,actualId=n.actualId}
     end
     reports[10]={actualId=status.roles and status.roles.map.CORE,role='CORE',time=status.time,ok=not status.error,state=status.state,error=status.error,version=status.version,gps=reports[10] and reports[10].gps}
     reports[11]={actualId=status.roles and status.roles.map.SENSOR_UI,role='SENSOR_UI',time=os.epoch('utc'),ok=true,state='UI / RELAY',error=relayError,version=VERSION,gps=reports[11] and reports[11].gps}
@@ -2526,7 +2730,7 @@ local function ui()
                 state={result=status.state,stages={'--','--','--'},radio='VIA 11',cycle=status.seq,lines=text},
                 telemetry={version=1,session=status.session,seq=status.seq,time=status.time,state=status.state,
                   inputs=status.inputs,relayAge=status.relayAge,zones=status.zones,error=status.error or relayError,angles=status.angles,diagnosticLines=diagnostics(),thrust=status.thrust,nodes=nodeReports(),rotation=status.rotation,
-                  blackbox=blackbox.status(),roles=status.roles,nav=status.nav,recovery=status.recovery,main=status.main,mainCommand=status.mainCommand,mainDemand=status.mainDemand,armed=status.armed,deadzone=status.deadzone,sensor={name=(status.diagnostic or {}).sensor,present=(status.diagnostic or {}).present,ok=(status.diagnostic or {}).sensorOK,
+                  attitudeDemand=status.attitudeDemand,attitudeDiagnostics=blackbox.attitude,blackbox=blackbox.status(),roles=status.roles,nav=status.nav,recovery=status.recovery,main=status.main,mainCommand=status.mainCommand,mainDemand=status.mainDemand,armed=status.armed,deadzone=status.deadzone,sensor={name=(status.diagnostic or {}).sensor,present=(status.diagnostic or {}).present,ok=(status.diagnostic or {}).sensorOK,
                     time=(status.diagnostic or {}).sensorTime,error=(status.diagnostic or {}).sensorError}}})
             end
           end
